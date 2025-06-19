@@ -8,6 +8,7 @@ for dirpath,_, filenames in os.walk(root_dir):
         if file.endswith(".csv"):
             file_path = os.path.join(dirpath, file)
             df = pd.read_csv(file_path, sep=" ",header=None)
+            keywords=["swipe","touch","scroll","touch_touch"]
             if "gyro" in file_path:
                 df.columns=["timestamp(ms)","orientation","x","y","z"]
                 print(df.head())
@@ -38,6 +39,10 @@ for dirpath,_, filenames in os.walk(root_dir):
                 df.to_csv(file_path,sep=",",index=False)
             elif "temp" in file_path:
                 df.columns=["timestamp(ms)","orientation","temperature"]
+                print(df.head())
+                df.to_csv(file_path,sep=",",index=False)
+            if any(kw in file_path for kw in keywords):
+                df.columns=["timestamp(ms)","orientation","x","y","p","action"]
                 print(df.head())
                 df.to_csv(file_path,sep=",",index=False)
             else:
