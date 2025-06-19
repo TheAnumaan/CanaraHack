@@ -6,7 +6,6 @@ end_folder = 598
 
 def process_bluetooth_file(file_path):
     try:
-        # Read original content
         with open(file_path, 'r') as infile:
             lines = infile.readlines()
 
@@ -21,14 +20,16 @@ def process_bluetooth_file(file_path):
                 processed_lines.append(line)
                 continue
 
-            part1 = line[:first_space]
-            part2 = line[first_space + 1:last_space]
-            part3 = line[last_space + 1:]
+            part1 = line[:first_space]                   # First token (likely timestamp)
+            part2 = line[first_space + 1:last_space]     # Device name
+            part3 = line[last_space + 1:]                # MAC address
 
+            # Remove quotes from part1 if any, add quotes to part2
+            part1 = part1.strip('"')  # Ensure it's unquoted
+            part2 = f'"{part2}"'      # Ensure name is quoted
             new_line = f"{part1},{part2},{part3}"
             processed_lines.append(new_line)
 
-        # Write back to the same file
         with open(file_path, 'w') as outfile:
             for line in processed_lines:
                 outfile.write(line + '\n')
@@ -38,7 +39,7 @@ def process_bluetooth_file(file_path):
     except Exception as e:
         print(f"❌ Failed to process {file_path}: {e}")
 
-# Traverse folders 000 to 600
+# Traverse folders 000 to 598
 for i in range(start_folder, end_folder + 1):
     folder_name = f"{i:03d}"
     folder_path = os.path.join(base_path, folder_name)
