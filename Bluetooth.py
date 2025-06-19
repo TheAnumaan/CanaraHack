@@ -1,6 +1,6 @@
 import os
 
-base_path = '/Users/riyamehdiratta/Downloads/HuMI '
+base_path = '/home/krish/repos/CanaraHack/HuMI/HuMI'
 start_folder = 0
 end_folder = 598
 
