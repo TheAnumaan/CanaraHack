@@ -13,11 +13,11 @@ def fix_invalid_json(text):
 for i in range(599):
     print(str(i))
     if i<10:
-        path = "/home/krish/repos/CanaraHack/HuMI/HuMI/00"+str(i)+"/info.json"
+        path = "/home/krish/repos/CanaraHack/HuMI (1)/HuMI/00"+str(i)+"/info.json"
     elif i<100:
-        path = "/home/krish/repos/CanaraHack/HuMI/HuMI/0"+str(i)+"/info.json"
+        path = "/home/krish/repos/CanaraHack/HuMI (1)/HuMI/0"+str(i)+"/info.json"
     else:
-        path = "/home/krish/repos/CanaraHack/HuMI/HuMI/"+str(i)+"/info.json"
+        path = "/home/krish/repos/CanaraHack/HuMI (1)/HuMI/"+str(i)+"/info.json"
 
     with open(path, "r") as f:
         raw = f.read()
