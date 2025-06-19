@@ -16,12 +16,12 @@ def change_delimiter_space_to_comma(file_path):
             for line in updated_lines:
                 outfile.write(line + '\n')
 
-        print(f"Delimiter changed to comma in '{file_path}'")
+        print(f"✅ Delimiter changed to comma in '{file_path}'")
 
     except FileNotFoundError:
-        print(f"File not found: {file_path}")
+        print(f"❌ File not found: {file_path}")
     except Exception as e:
-        print(f"Error processing {file_path}: {e}")
+        print(f"❌ Error processing {file_path}: {e}")
 
 # Traverse folders 000 to 600
 for i in range(start_folder, end_folder + 1):
