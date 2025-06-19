@@ -28,3 +28,4 @@ for i in range(599):
     df = pd.json_normalize([data])
     print(df.head())
 
+    df.to_json(path)
