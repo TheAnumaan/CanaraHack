@@ -40,9 +40,4 @@ for i in range(start_folder, end_folder + 1):
         wifi_file = os.path.join(session_path, 'wifi.csv')
 
         if os.path.isfile(wifi_file):
-            process_bluetooth_file(wifi_file)
-
-
-# Example usage
-file_path = 'wifi.csv'
-change_delimiter_space_to_comma(file_path)
+            change_delimiter_space_to_comma(wifi_file)
