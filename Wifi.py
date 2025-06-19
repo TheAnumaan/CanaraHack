@@ -1,6 +1,6 @@
 import os
 
-base_path = '/Users/riyamehdiratta/Downloads/HuMI '
+base_path = '/home/krish/repos/CanaraHack/HuMI/HuMI'
 start_folder = 0
 end_folder = 598
 
@@ -16,12 +16,12 @@ def change_delimiter_space_to_comma(file_path):
             for line in updated_lines:
                 outfile.write(line + '\n')
 
-        print(f"✅ Delimiter changed to comma in '{file_path}'")
+        print(f"Delimiter changed to comma in '{file_path}'")
 
     except FileNotFoundError:
-        print(f"❌ File not found: {file_path}")
+        print(f"File not found: {file_path}")
     except Exception as e:
-        print(f"❌ Error processing {file_path}: {e}")
+        print(f"Error processing {file_path}: {e}")
 
 # Traverse folders 000 to 600
 for i in range(start_folder, end_folder + 1):
@@ -40,7 +40,7 @@ for i in range(start_folder, end_folder + 1):
         wifi_file = os.path.join(session_path, 'wifi.csv')
 
         if os.path.isfile(wifi_file):
-            process_bluetooth_file(wifi_file)
+            change_delimiter_space_to_comma(wifi_file)
 
 
 # Example usage
