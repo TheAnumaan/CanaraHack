@@ -1,12 +1,16 @@
 import os
 import pandas as pd
-import glob
+from functools import reduce
 
-# Set this to your HuMI dataset root
-root_dir = "/Users/kkartikaggarwal/Desktop/coding folder2/canrabank/HuMI"
-output_dir = "/Users/kkartikaggarwal/Desktop/coding folder2/canrabank/temp_outputs"
+# Change to the desired user folder (e.g., u00, u01)
+target_user = "000"
+
+# Path settings
+root_dir = "/home/krish/repos/CanaraHack/HuMI (1)/HuMI/"
+output_dir = "/home/krish/repos/CanaraHack/"
 os.makedirs(output_dir, exist_ok=True)
 
+# Known column mappings
 column_mappings = {
     "bluetooth.csv": ["timestamp", "bt_name", "bt_mac"],
     "gps.csv": ["timestamp", "orientation", "latitude", "longitude", "altitude", "bearing", "accuracy"],
@@ -22,23 +26,29 @@ column_mappings = {
     "sensor_temp.csv": ["timestamp", "orientation", "temperature"],
     "key_data.csv": ["timestamp", "key_field", "ascii_code"],
     "swipe.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
-    "scroll_X_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
+    "scroll_d_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
+    "scroll_u_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
     "touch_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
-    "f_X_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
+    "f_0_touch.csv": ["timestamp", "orientation", "x", "y", "pressure", "action"],
+    # Add more FINGER_X touch mappings if needed
 }
 
+# Main CSV parser
 def process_csv(file_path, user, session, task, relative_name):
     try:
+        print(f"📄 Processing: {file_path}")
         if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
             print(f"⚠️ Skipped empty file: {file_path}")
             return None
 
         df = pd.read_csv(file_path, engine='python', on_bad_lines='skip')
         if df.empty:
+            print(f"⚠️ Skipped empty content in: {file_path}")
             return None
 
         df.dropna(how='all', inplace=True)
         if df.empty:
+            print(f"⚠️ All NaNs in: {file_path}")
             return None
 
         base_file = os.path.basename(file_path)
@@ -50,6 +60,7 @@ def process_csv(file_path, user, session, task, relative_name):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
         df.dropna(subset=['timestamp'], inplace=True)
         if df.empty:
+            print(f"⚠️ All invalid timestamps in: {file_path}")
             return None
 
         df.set_index('timestamp', inplace=True)
@@ -67,42 +78,58 @@ def process_csv(file_path, user, session, task, relative_name):
         print(f"❌ Error processing {file_path}: {e}")
         return None
 
-# Traverse the dataset
-for user in os.listdir(root_dir):
-    user_path = os.path.join(root_dir, user)
-    if not os.path.isdir(user_path):
+# Begin per-user merge
+user_path = os.path.join(root_dir, target_user)
+if not os.path.isdir(user_path):
+    print(f"❌ User folder not found: {user_path}")
+    exit()
+
+user_dfs = []
+
+for session in os.listdir(user_path):
+    session_path = os.path.join(user_path, session)
+    if not os.path.isdir(session_path) or not session.lower().startswith("sesion"):
         continue
 
-    for session in os.listdir(user_path):
-        session_path = os.path.join(user_path, session)
-        if not os.path.isdir(session_path) or not session.lower().startswith('sesion'):
-            continue
+    dfs = []
+    for root, _, files in os.walk(session_path):
+        for file in files:
+            if not file.endswith(".csv"):
+                continue  # Skip non-CSV files like .npy, .3gp
 
-        dfs = []
-        for root, _, files in os.walk(session_path):
-            for file in files:
-                if file.endswith(".csv"):
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(file_path, session_path)
-                    parts = rel_path.split(os.sep)
-                    task = parts[0] if len(parts) > 1 else None
-                    rel_name = os.path.join(*parts[1:]) if task else file
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, session_path)
+            parts = rel_path.split(os.sep)
 
-                    df = process_csv(file_path, user, session, task, rel_name)
-                    if df is not None:
-                        dfs.append(df)
+            # Determine task and relative filename
+            if len(parts) >= 2 and parts[1] == "SENSORS":
+                task = parts[0]
+                rel_name = parts[2] if len(parts) >= 3 else parts[1]
+            elif len(parts) >= 2:
+                task = parts[0]
+                rel_name = os.path.join(*parts[1:])
+            else:
+                task = None
+                rel_name = parts[0]
 
-        if dfs:
-            print(f"💾 Saving merged session: {user} {session}")
-            merged = pd.concat(dfs, axis=1)
-            merged.reset_index(inplace=True)
-            merged.insert(0, "session", session)
-            merged.insert(0, "user", user)
-            merged.to_csv(f"{output_dir}/{user}_{session}.csv", index=False)
+            print(f"➡️ Detected: task={task}, rel_name={rel_name}")
+            df = process_csv(file_path, target_user, session, task, rel_name)
+            if df is not None:
+                dfs.append(df)
 
-# Final merge of all session CSVs
-print("📦 Final merging all session files...")
-csvs = glob.glob(f"{output_dir}/*.csv")
-final_df = pd.concat([pd.read_csv(f) for f in csvs], axis=0)
-final_df.to_csv("final_HUMIdb_merged_cleaned.csv", index=False)
-print("✅ Saved: final_HUMIdb_merged_cleaned.csv")
+    if dfs:
+        print(f"🔗 Merging session: {target_user} {session}")
+        dfs = [df.reset_index() for df in dfs]
+        merged_session = reduce(
+            lambda left, right: pd.merge(left, right, on=["timestamp", "user", "session"], how="outer"),
+            dfs
+        )
+        user_dfs.append(merged_session)
+
+if user_dfs:
+    final_user_df = pd.concat(user_dfs, axis=0, ignore_index=True)
+    output_path = os.path.join(output_dir, f"{target_user}_all_sessions.csv")
+    final_user_df.to_csv(output_path, index=False)
+    print(f"✅ Final user CSV saved: {output_path}")
+else:
+    print(f"⚠️ No valid sessions found for user {target_user}")
