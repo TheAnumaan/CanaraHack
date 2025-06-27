@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 
-root_dir = os.path.expanduser("~/repos/CanaraHack/HuMI (1)/HuMI/")
+root_dir = os.path.expanduser("/Users/kkartikaggarwal/REPOS/CanaraHack/HuMI/")
 
 keywords = ["swipe", "touch", "scroll", "touch_touch"]
 
