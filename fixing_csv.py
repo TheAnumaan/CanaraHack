@@ -34,6 +34,10 @@ for dirpath, _, filenames in os.walk(root_dir):
                 elif "temp" in file_path.lower():
                     df.columns = ["timestamp(ms)", "orientation", "temperature"]
 
+                elif "wifi" in file_path.lower():
+                    df.columns = ["timestamp(ms)", "SSID","level","info","channel","frequency"]
+                elif "bluetooth" in file_path.lower():
+                    df.columns = ["timestamp (ms)","name","MAC"]
                 else:
                     print(f"Unrecognized sensor file format: {file_path}")
                     continue
