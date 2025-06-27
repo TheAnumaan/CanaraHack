@@ -6,35 +6,34 @@ end_folder = 598
 
 def process_bluetooth_file(file_path):
     try:
-        with open(file_path, 'r') as infile:
-            lines = infile.readlines()
-
         processed_lines = []
 
-        for line in lines:
-            line = line.strip()
-            first_space = line.find(' ')
-            last_space = line.rfind(' ')
+        with open(file_path, 'r') as infile:
+            for line in infile:
+                line = line.strip()
 
-            if first_space == -1 or last_space == -1 or first_space == last_space:
-                processed_lines.append(line)
-                continue
+                # Check for at least two spaces (i.e., three columns)
+                first_space = line.find(' ')
+                last_space = line.rfind(' ')
 
-            part1 = line[:first_space]                   # First token (likely timestamp)
-            part2 = line[first_space + 1:last_space]     # Device name
-            part3 = line[last_space + 1:]                # MAC address
+                if first_space == -1 or last_space == -1 or first_space == last_space:
+                    continue  # Skip malformed lines
 
-            # Remove quotes from part1 if any, add quotes to part2
-            part1 = part1.strip('"')  # Ensure it's unquoted
-            part2 = f'"{part2}"'      # Ensure name is quoted
-            new_line = f"{part1},{part2},{part3}"
-            processed_lines.append(new_line)
+                part1 = line[:first_space]                 # timestamp
+                part2 = line[first_space + 1:last_space]   # device name (may have spaces)
+                part3 = line[last_space + 1:]              # MAC address
+
+                part1 = part1.strip('"')                   # remove quotes if any
+                part2 = f'"{part2.strip()}"'               # ensure device name is quoted
+                part3 = part3.strip()
+
+                processed_lines.append(f"{part1},{part2},{part3}")
 
         with open(file_path, 'w') as outfile:
             for line in processed_lines:
                 outfile.write(line + '\n')
 
-        print(f"✅ Overwritten: {file_path}")
+        print(f"✅ Cleaned: {file_path}")
 
     except Exception as e:
         print(f"❌ Failed to process {file_path}: {e}")

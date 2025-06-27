@@ -4,26 +4,31 @@ base_path = '/Users/kkartikaggarwal/REPOS/CanaraHack/HuMI/'
 start_folder = 0
 end_folder = 598
 
-def change_delimiter_space_to_comma(file_path):
+def clean_wifi_csv(file_path):
     try:
-        with open(file_path, 'r') as infile:
-            lines = infile.readlines()
+        cleaned_lines = []
 
-        # Replace spaces with commas (but only between words)
-        updated_lines = [','.join(line.strip().split()) for line in lines]
+        with open(file_path, 'r') as infile:
+            for line in infile:
+                # Split line using any whitespace
+                columns = line.strip().split()
+
+                # Only include rows with exactly 6 columns
+                if len(columns) == 6:
+                    cleaned_lines.append(','.join(columns))
 
         with open(file_path, 'w') as outfile:
-            for line in updated_lines:
+            for line in cleaned_lines:
                 outfile.write(line + '\n')
 
-        print(f"✅ Delimiter changed to comma in '{file_path}'")
+        print(f"✅ Cleaned and formatted: {file_path}")
 
     except FileNotFoundError:
         print(f"❌ File not found: {file_path}")
     except Exception as e:
         print(f"❌ Error processing {file_path}: {e}")
 
-# Traverse folders 000 to 600
+# Traverse folders 000 to 598
 for i in range(start_folder, end_folder + 1):
     folder_name = f"{i:03d}"
     folder_path = os.path.join(base_path, folder_name)
@@ -40,9 +45,9 @@ for i in range(start_folder, end_folder + 1):
         wifi_file = os.path.join(session_path, 'wifi.csv')
 
         if os.path.isfile(wifi_file):
-            change_delimiter_space_to_comma(wifi_file)
+            clean_wifi_csv(wifi_file)
 
-
-# Example usage
-file_path = 'wifi.csv'
-change_delimiter_space_to_comma(file_path)
+# Optional: Run on a single file for testing
+test_file = 'wifi.csv'
+if os.path.exists(test_file):
+    clean_wifi_csv(test_file)
