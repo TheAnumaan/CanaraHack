@@ -71,6 +71,8 @@ for dirpath, _, filenames in os.walk(root_dir):
                         expected_cols = ["timestamp(ms)", "name", "MAC"]
                     elif "gps" in file_lower:
                         expected_cols = ["timestamp(ms)", "orientation", "latitude", "longitude", "altitude", "bearing", "accuracy"]
+                    elif "key_data" in file_lower:
+                        expected_cols = ["timestamp(ms)", "field", "ascii_code"]
 
                     if expected_cols:
                         if df.shape[1] != len(expected_cols):
