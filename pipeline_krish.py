@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import os
 import pandas as pd
 from torch.utils.data import Dataset
@@ -63,18 +64,31 @@ class MultimodalFusion(nn.Module):
         x = torch.cat(embeddings, dim=1)
         return self.fusion(x)
 
-class SiameseModel(nn.Module):
-    def __init__(self, encoder):
+class SigLipLoss(nn.Module):
+    def __init__(self, temperature=0.07):
         super().__init__()
-        self.encoder = encoder
+        self.temperature = temperature
 
-    def forward_once(self, x):
-        return self.encoder(x)
+    def forward(self, embeddings, labels):
+        # Normalize embeddings
+        embeddings = F.normalize(embeddings, dim=1)
+        sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
 
-    def forward(self, x1, x2):
-        embed1 = self.forward_once(x1)
-        embed2 = self.forward_once(x2)
-        return F.cosine_similarity(embed1, embed2)
+        # Binary mask of same labels (same user)
+        label_matrix = labels.unsqueeze(1) == labels.unsqueeze(0)
+        label_matrix = label_matrix.float()
+
+        # Exclude self-similarity
+        mask = ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+        sim_matrix = sim_matrix[mask].view(len(labels), -1)
+        label_matrix = label_matrix[mask].view(len(labels), -1)
+
+        # Apply sigmoid to similarities
+        sim_scores = torch.sigmoid(sim_matrix)
+
+        # Sigmoid binary cross-entropy
+        loss = F.binary_cross_entropy(sim_scores, label_matrix)
+        return loss
 
 class CSVSessionDataset(Dataset):
     def __init__(self, root_dir, sensor='gps', max_len=1000):
