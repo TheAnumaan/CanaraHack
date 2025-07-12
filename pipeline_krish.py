@@ -11,8 +11,8 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
-# Directory path where all sensor folders are located
-DATA_ROOT = "/path/to/your/dataset/root"
+# Directory path where all user folders (e.g., u00, u01, ...) are located
+DATA_ROOT = "/path/to/your/user_folders"
 
 class TCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
@@ -96,23 +96,33 @@ class MultimodalSessionDataset(Dataset):
         self.sensor_list = sensor_list
 
         for user_folder in os.listdir(root_dir):
-            if not user_folder.startswith("user_"):
-                continue
-            user_id = int(user_folder.split('_')[-1])
             user_path = os.path.join(root_dir, user_folder)
-            sessions = os.listdir(user_path)
-            for session_file in sessions:
-                if session_file.endswith('.csv'):
-                    session_name = '_'.join(session_file.split('_')[:-1])
-                    for sensor in sensor_list:
-                        if session_file.startswith(sensor):
-                            self.samples.append({
-                                'user_id': user_id,
-                                'session_id': session_file.split('.')[0],
-                                'paths': {
-                                    sensor: os.path.join(user_path, session_file)
-                                }
-                            })
+            if not os.path.isdir(user_path):
+                continue
+
+            user_id = int(user_folder.strip("u"))
+            data_paths = {
+                'gps': os.path.join(user_path, 'gps.csv'),
+                'wifi': os.path.join(user_path, 'wifi.csv'),
+                'bluetooth': os.path.join(user_path, 'bluetooth.csv'),
+                'key_data': os.path.join(user_path, 'KEYSTROKE', 'key_data.csv'),
+                'swipe': os.path.join(user_path, 'TOUCH', 'swipe.csv'),
+                'f_0_touch': os.path.join(user_path, 'TOUCH', 'f_0_touch.csv'),
+                'sensor_grav': os.path.join(user_path, 'SENSORS', 'sensor_grav.csv'),
+                'sensor_gyro': os.path.join(user_path, 'SENSORS', 'sensor_gyro.csv'),
+                'sensor_humd': os.path.join(user_path, 'SENSORS', 'sensor_humd.csv'),
+                'sensor_lacc': os.path.join(user_path, 'SENSORS', 'sensor_lacc.csv'),
+                'sensor_ligh': os.path.join(user_path, 'SENSORS', 'sensor_ligh.csv'),
+                'sensor_magn': os.path.join(user_path, 'SENSORS', 'sensor_magn.csv'),
+                'sensor_nacc': os.path.join(user_path, 'SENSORS', 'sensor_nacc.csv'),
+                'sensor_prox': os.path.join(user_path, 'SENSORS', 'sensor_prox.csv'),
+                'sensor_temp': os.path.join(user_path, 'SENSORS', 'sensor_temp.csv')
+            }
+
+            self.samples.append({
+                'user_id': user_id,
+                'paths': data_paths
+            })
 
     def __len__(self):
         return len(self.samples)
@@ -138,7 +148,7 @@ class MultimodalSessionDataset(Dataset):
                     data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
                 elif sensor.startswith('sensor_'):
                     data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
-                elif sensor in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
+                elif sensor in ['swipe', 'f_0_touch']:
                     data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
                 elif sensor == 'key_data':
                     ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
