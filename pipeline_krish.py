@@ -5,6 +5,8 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import concurrent.futures
+from multiprocessing import cpu_count
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score, roc_curve
 
@@ -97,7 +99,7 @@ class MultimodalSessionDataset(Dataset):
             sessions = os.listdir(user_path)
             for session_file in sessions:
                 if session_file.endswith('.csv'):
-                    session_name = '_'.join(session_file.split('_')[:-1])  # e.g., gps_session1.csv → gps
+                    session_name = '_'.join(session_file.split('_')[:-1])
                     for sensor in sensor_list:
                         if session_file.startswith(sensor):
                             self.samples.append({
@@ -112,7 +114,9 @@ class MultimodalSessionDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sample = self.samples[idx]
+        return self._load_sample(self.samples[idx])
+
+    def _load_sample(self, sample):
         tensors = []
         for sensor in self.sensor_list:
             path = sample['paths'].get(sensor)
@@ -215,6 +219,15 @@ def evaluate_embeddings(model, dataloader, device):
     plt.show()
 
     return eer, auc
+
+# Configure DataLoader for multiprocessing
+DataLoaderMP = lambda dataset, batch_size, shuffle=True: DataLoader(
+    dataset,
+    batch_size=batch_size,
+    shuffle=shuffle,
+    num_workers=min(cpu_count(), 8),
+    pin_memory=True
+)
 
 # this is a fusion model which chatgpt gave to me i'll see if i can use it
 
