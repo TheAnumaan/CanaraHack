@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import roc_auc_score, roc_curve
@@ -82,60 +83,89 @@ class SigLipLoss(nn.Module):
         loss = F.binary_cross_entropy(sim_scores, label_matrix)
         return loss
 
-class CSVSessionDataset(Dataset):
-    def __init__(self, root_dir, sensor='gps', max_len=1000):
+class MultimodalSessionDataset(Dataset):
+    def __init__(self, root_dir, sensor_list, max_len=1000):
         self.samples = []
         self.max_len = max_len
-        self.sensor = sensor
+        self.sensor_list = sensor_list
 
         for user_folder in os.listdir(root_dir):
             if not user_folder.startswith("user_"):
                 continue
             user_id = int(user_folder.split('_')[-1])
             user_path = os.path.join(root_dir, user_folder)
-
-            for file in os.listdir(user_path):
-                if file.startswith(sensor) and file.endswith('.csv'):
-                    self.samples.append({
-                        'csv_path': os.path.join(user_path, file),
-                        'user_id': user_id
-                    })
+            sessions = os.listdir(user_path)
+            for session_file in sessions:
+                if session_file.endswith('.csv'):
+                    session_name = '_'.join(session_file.split('_')[:-1])  # e.g., gps_session1.csv → gps
+                    for sensor in sensor_list:
+                        if session_file.startswith(sensor):
+                            self.samples.append({
+                                'user_id': user_id,
+                                'session_id': session_file.split('.')[0],
+                                'paths': {
+                                    sensor: os.path.join(user_path, session_file)
+                                }
+                            })
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        df = pd.read_csv(sample['csv_path'], header=None)
+        tensors = []
+        for sensor in self.sensor_list:
+            path = sample['paths'].get(sensor)
+            if path and os.path.exists(path):
+                df = pd.read_csv(path, header=None)
+                if sensor == 'gps':
+                    data = torch.tensor(df.iloc[:, [2, 3, 4, 5, 6]].values, dtype=torch.float)
+                elif sensor == 'bluetooth':
+                    data = df.iloc[:, [1, 2]].astype(str)
+                    data = torch.tensor([
+                        [len(name), float(int("0x" + mac.replace(":", ""), 16) % 1e9)]
+                        for name, mac in data.values
+                    ], dtype=torch.float)
+                elif sensor == 'wifi':
+                    data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
+                elif sensor.startswith('sensor_'):
+                    data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
+                elif sensor in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
+                    data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
+                elif sensor == 'key_data':
+                    ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
+                    data = torch.tensor(ascii_vals.values.reshape(-1, 1), dtype=torch.float)
+                else:
+                    data = torch.zeros(self.max_len, 1)
 
-        if self.sensor == 'gps':
-            data = torch.tensor(df.iloc[:, [2, 3, 4, 5, 6]].values, dtype=torch.float)
-        elif self.sensor == 'bluetooth':
-            data = df.iloc[:, [1, 2]].astype(str)
-            data = torch.tensor([
-                [len(name), float(int("0x" + mac.replace(":", ""), 16) % 1e9)]
-                for name, mac in data.values
-            ], dtype=torch.float)
-        elif self.sensor == 'wifi':
-            data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
-        elif self.sensor.startswith('sensor_'):
-            data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
-        elif self.sensor in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
-            data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
-        elif self.sensor == 'key_data':
-            ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
-            data = torch.tensor(ascii_vals.values.reshape(-1, 1), dtype=torch.float)
-        else:
-            raise ValueError(f"Unknown sensor type: {self.sensor}")
+                T, D = data.shape
+                if T > self.max_len:
+                    data = data[:self.max_len]
+                elif T < self.max_len:
+                    pad = torch.zeros(self.max_len - T, D)
+                    data = torch.cat([data, pad], dim=0)
+                tensors.append(data)
+            else:
+                tensors.append(torch.zeros(self.max_len, 1))
 
-        T, D = data.shape
-        if T > self.max_len:
-            data = data[:self.max_len]
-        elif T < self.max_len:
-            pad = torch.zeros(self.max_len - T, D)
-            data = torch.cat([data, pad], dim=0)
+        tensor_stack = torch.stack(tensors)
+        return tensor_stack, sample['user_id']
 
-        return data, sample['user_id']
+class MultimodalEmbeddingModel(nn.Module):
+    def __init__(self, sensor_dims, hidden_dim=32, fusion_dim=128):
+        super().__init__()
+        self.encoders = nn.ModuleDict({
+            sensor: ModalityEncoder(sensor, dim, hidden_dim)
+            for sensor, dim in sensor_dims.items()
+        })
+        self.fusion = MultimodalFusion([hidden_dim for _ in sensor_dims])
+
+    def forward(self, inputs):
+        embeddings = []
+        for i, (sensor, encoder) in enumerate(self.encoders.items()):
+            x = inputs[:, i, :, :]
+            embeddings.append(encoder(x))
+        return self.fusion(embeddings)
 
 # Training + Evaluation
 
