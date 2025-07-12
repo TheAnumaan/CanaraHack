@@ -3,7 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import pandas as pd
-from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_auc_score, roc_curve
 
 class TCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
@@ -60,7 +62,6 @@ class MultimodalFusion(nn.Module):
         )
 
     def forward(self, embeddings):
-        # embeddings: List of modality tensors [B, D_i]
         x = torch.cat(embeddings, dim=1)
         return self.fusion(x)
 
@@ -70,23 +71,14 @@ class SigLipLoss(nn.Module):
         self.temperature = temperature
 
     def forward(self, embeddings, labels):
-        # Normalize embeddings
         embeddings = F.normalize(embeddings, dim=1)
         sim_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
-
-        # Binary mask of same labels (same user)
         label_matrix = labels.unsqueeze(1) == labels.unsqueeze(0)
         label_matrix = label_matrix.float()
-
-        # Exclude self-similarity
         mask = ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
         sim_matrix = sim_matrix[mask].view(len(labels), -1)
         label_matrix = label_matrix[mask].view(len(labels), -1)
-
-        # Apply sigmoid to similarities
         sim_scores = torch.sigmoid(sim_matrix)
-
-        # Sigmoid binary cross-entropy
         loss = F.binary_cross_entropy(sim_scores, label_matrix)
         return loss
 
@@ -144,6 +136,55 @@ class CSVSessionDataset(Dataset):
             data = torch.cat([data, pad], dim=0)
 
         return data, sample['user_id']
+
+# Training + Evaluation
+
+def train_epoch(model, dataloader, loss_fn, optimizer, device):
+    model.train()
+    total_loss = 0
+    for x, labels in dataloader:
+        x, labels = x.to(device), labels.to(device)
+        embeddings = model(x)
+        loss = loss_fn(embeddings, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+def evaluate_embeddings(model, dataloader, device):
+    model.eval()
+    all_embeddings = []
+    all_labels = []
+    with torch.no_grad():
+        for x, labels in dataloader:
+            x, labels = x.to(device), labels.to(device)
+            embeddings = model(x)
+            all_embeddings.append(embeddings)
+            all_labels.append(labels)
+
+    embeddings = torch.cat(all_embeddings)
+    labels = torch.cat(all_labels)
+    sims = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2)
+    label_matrix = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()
+
+    mask = ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+    sims = sims[mask]
+    targets = label_matrix[mask]
+
+    fpr, tpr, thresholds = roc_curve(targets.cpu().numpy(), sims.cpu().numpy())
+    eer = fpr[np.nanargmin(np.absolute((1 - tpr - fpr)))]
+    auc = roc_auc_score(targets.cpu(), sims.cpu())
+
+    plt.hist(sims[targets == 1].cpu().numpy(), bins=50, alpha=0.6, label='Same User')
+    plt.hist(sims[targets == 0].cpu().numpy(), bins=50, alpha=0.6, label='Different User')
+    plt.legend()
+    plt.title("Cosine Similarity Distribution")
+    plt.xlabel("Cosine Similarity")
+    plt.ylabel("Frequency")
+    plt.show()
+
+    return eer, auc
 
 # this is a fusion model which chatgpt gave to me i'll see if i can use it
 
