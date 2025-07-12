@@ -7,8 +7,12 @@ import numpy as np
 import matplotlib.pyplot as plt
 import concurrent.futures
 from multiprocessing import cpu_count
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split
+
+# Directory path where all sensor folders are located
+DATA_ROOT = "/path/to/your/dataset/root"
 
 class TCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
@@ -219,6 +223,15 @@ def evaluate_embeddings(model, dataloader, device):
     plt.show()
 
     return eer, auc
+
+# Split users into train/test
+
+def split_dataset_by_user(dataset, test_size=0.2, random_state=42):
+    user_ids = list(set(sample['user_id'] for sample in dataset.samples))
+    train_users, test_users = train_test_split(user_ids, test_size=test_size, random_state=random_state)
+    train_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in train_users]
+    test_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in test_users]
+    return Subset(dataset, train_indices), Subset(dataset, test_indices)
 
 # Configure DataLoader for multiprocessing
 DataLoaderMP = lambda dataset, batch_size, shuffle=True: DataLoader(
