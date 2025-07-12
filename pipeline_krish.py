@@ -1,35 +1,30 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-# first making the TCN model
+import os
+import pandas as pd
+from torch.utils.data import Dataset
 
 class TCNBlock(nn.Module):
-    def __init__(self,input_dim,output_dim,kernel_size=3,num_layers=3):
+    def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
         super().__init__()
         layers = []
         for i in range(num_layers):
             dilation = 2 ** i
-            layers.append(nn.Conv1d(input_dim if i == 0 else output_dim, output_dim, kernel_size, 
-                                    padding=(kernel_size - 1) * dilation, dilation=dilation))
+            layers.append(nn.Conv1d(
+                input_dim if i == 0 else output_dim,
+                output_dim,
+                kernel_size,
+                padding=(kernel_size - 1) * dilation,
+                dilation=dilation
+            ))
             layers.append(nn.ReLU())
-
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
-        out = self.network()
-        out = torch.mean(out, dim=2)
+        x = x.permute(0, 2, 1)  # [B, D, T] for Conv1d
+        out = self.network(x)
+        out = torch.mean(out, dim=2)  # Global average pooling
         return out
-
-import os
-import torch
-from torch.utils.data import Dataset
-import pandas as pd
-
-# Dataset class to load user/session CSVs
-# This assumes each user has a folder named "user_<id>" containing their session CSVs
-# The CSVs are expected to have a consistent format with a timestamp and sensor data
 
 class CSVSessionDataset(Dataset):
     def __init__(self, root_dir, sensor='gps', max_len=1000):
@@ -37,13 +32,14 @@ class CSVSessionDataset(Dataset):
         self.max_len = max_len
         self.sensor = sensor
 
-        # Walk through all user/session CSVs
         for user_folder in os.listdir(root_dir):
+            if not user_folder.startswith("user_"):
+                continue
             user_id = int(user_folder.split('_')[-1])
             user_path = os.path.join(root_dir, user_folder)
 
             for file in os.listdir(user_path):
-                if file.endswith('.csv'):
+                if file.startswith(sensor) and file.endswith('.csv'):
                     self.samples.append({
                         'csv_path': os.path.join(user_path, file),
                         'user_id': user_id
@@ -54,16 +50,34 @@ class CSVSessionDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        df = pd.read_csv(sample['csv_path'])
+        df = pd.read_csv(sample['csv_path'], header=None)
 
-        # Select only the sensor columns (drop timestamp)
         if self.sensor == 'gps':
-            data = torch.tensor(df[['latitude', 'longitude']].values, dtype=torch.float)
+            # Columns: timestamp, orientation, lat, lon, alt, bearing, accuracy
+            data = torch.tensor(df.iloc[:, [2, 3, 4, 5, 6]].values, dtype=torch.float)
+        elif self.sensor == 'bluetooth':
+            # Columns: timestamp, name, MAC
+            # Use name length and MAC encoded as float (hash-based simple encoding)
+            data = df.iloc[:, [1, 2]].astype(str)
+            data = torch.tensor([
+                [len(name), float(int("0x" + mac.replace(":", ""), 16) % 1e9)]
+                for name, mac in data.values
+            ], dtype=torch.float)
         elif self.sensor == 'wifi':
-            data = torch.tensor(df[['rssi']].values, dtype=torch.float)
-        # Add cases for other sensors
+            # Columns: timestamp, name, level, info, channel, frequency
+            data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
+        elif self.sensor.startswith('sensor_'):
+            # Handle all sensor files with common logic
+            data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
+        elif self.sensor in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
+            data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
+        elif self.sensor == 'key_data':
+            # Columns: timestamp, field, ASCII code (may be NaN)
+            ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
+            data = torch.tensor(ascii_vals.values.reshape(-1, 1), dtype=torch.float)
+        else:
+            raise ValueError(f"Unknown sensor type: {self.sensor}")
 
-        # Trim or pad if needed
         T, D = data.shape
         if T > self.max_len:
             data = data[:self.max_len]
@@ -72,7 +86,6 @@ class CSVSessionDataset(Dataset):
             data = torch.cat([data, pad], dim=0)
 
         return data, sample['user_id']
-
 # this is a fusion model which chatgpt gave to me i'll see if i can use it
 
 # class MultimodalUserEncoder(nn.Module):
