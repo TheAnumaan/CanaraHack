@@ -11,19 +11,23 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[INFO] Using device: {DEVICE}")
+
 # Directory path where all user folders (e.g., 000, 001, ...) are located
-DATA_ROOT = "/path/to/your/user_folders"
+DATA_ROOT = "/home/bsnl/Documents/HuMI"
 
 class TCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
         super().__init__()
         layers = []
+        self.input_dim = input_dim
         for i in range(num_layers):
             dilation = 2 ** i
             layers.append(nn.Conv1d(
-                input_dim if i == 0 else output_dim,
-                output_dim,
-                kernel_size,
+                in_channels=input_dim if i == 0 else output_dim,
+                out_channels=output_dim,
+                kernel_size=kernel_size,
                 padding=(kernel_size - 1) * dilation,
                 dilation=dilation
             ))
@@ -31,9 +35,18 @@ class TCNBlock(nn.Module):
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # [B, D, T] for Conv1d
+        x = x.permute(0, 2, 1)
+        if x.shape[1] != self.input_dim:
+            print(f"[TCNBlock Warning] Expected {self.input_dim} input channels, but got {x.shape[1]}. Attempting to reshape.")
+            if x.shape[1] == 1:
+                x = x.repeat(1, self.input_dim, 1)
+                print(f"[TCNBlock] Repeated single-channel input to {self.input_dim} channels.")
+            else:
+                raise ValueError(f"[TCNBlock Error] Cannot match input channels: expected {self.input_dim}, got {x.shape[1]}")
+
+        print(f"[TCNBlock] Processing input with shape: {x.shape}")
         out = self.network(x)
-        out = torch.mean(out, dim=2)  # Global average pooling
+        out = torch.mean(out, dim=2)
         return out
 
 class ModalityEncoder(nn.Module):
@@ -60,6 +73,9 @@ class ModalityEncoder(nn.Module):
             raise ValueError(f"Unknown sensor type: {sensor_type}")
 
     def forward(self, x):
+        if isinstance(self.encoder, nn.Sequential):
+            # Apply mean pooling over time dimension if using Linear encoder
+            x = torch.mean(x, dim=1)  # from (B, T, D) → (B, D)
         return self.encoder(x)
 
 class MultimodalFusion(nn.Module):
@@ -267,6 +283,106 @@ DataLoaderMP = lambda dataset, batch_size, shuffle=True: DataLoader(
     num_workers=min(cpu_count(), 8),
     pin_memory=True
 )
+
+# (Previous code remains unchanged)
+
+from torch.utils.data import random_split
+from tqdm import tqdm
+
+def split_dataset_by_user(dataset, test_ratio=0.2):
+    user_ids = list(set([s['user_id'] for s in dataset.samples]))
+    user_ids.sort()
+    n_test = int(len(user_ids) * test_ratio)
+    test_ids = set(user_ids[-n_test:])
+    train_ids = set(user_ids[:-n_test])
+
+    train_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in train_ids]
+    test_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in test_ids]
+
+    return Subset(dataset, train_indices), Subset(dataset, test_indices)
+
+def evaluate_model(model, dataloader):
+    print("[Eval] Computing embeddings and similarities...")
+    model.eval()
+    embeddings = []
+    labels = []
+    with torch.no_grad():
+        for x, y in tqdm(dataloader):
+            x, y = x.cuda(), y.cuda()
+            emb = model(x)
+            embeddings.append(emb)
+            labels.append(y)
+
+    embeddings = torch.cat(embeddings, dim=0)
+    labels = torch.cat(labels, dim=0)
+
+    # Compute pairwise cosine similarities
+    sims = torch.matmul(F.normalize(embeddings, dim=1), F.normalize(embeddings, dim=1).T)
+    same_user = labels.unsqueeze(0) == labels.unsqueeze(1)
+    mask = ~torch.eye(len(labels), dtype=torch.bool, device=labels.device)
+
+    y_true = same_user[mask].cpu().numpy().astype(int)
+    y_score = sims[mask].cpu().numpy()
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc = roc_auc_score(y_true, y_score)
+    eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
+
+    print(f"[Eval] AUC: {auc:.4f}, EER: {eer:.4f}")
+    return auc, eer
+
+
+if __name__ == "__main__":
+    DATA_ROOT = "/home/bsnl/Documents/HuMI"
+
+    sensor_list = [
+        'gps', 'wifi', 'bluetooth', 'key_data', 'swipe', 'f_X_touch',
+        'sensor_grav', 'sensor_gyro', 'sensor_humd', 'sensor_lacc',
+        'sensor_ligh', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp'
+    ]
+
+    print("[Main] Creating dataset...")
+    dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list)
+    print(f"[Main] Total users in dataset: {len(dataset)}")
+
+    print("[Main] Splitting train/test users...")
+    train_dataset, test_dataset = split_dataset_by_user(dataset)
+    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
+
+    print("[Main] Building model...")
+    sensor_dims = {
+        'gps': 5, 'wifi': 3, 'bluetooth': 2, 'key_data': 1, 'swipe': 4, 'f_X_touch': 4,
+        'sensor_grav': 3, 'sensor_gyro': 3, 'sensor_humd': 3, 'sensor_lacc': 3,
+        'sensor_ligh': 1, 'sensor_magn': 3, 'sensor_nacc': 3, 'sensor_prox': 1, 'sensor_temp': 1
+    }
+
+    model = MultimodalEmbeddingModel(sensor_dims).to(DEVICE)
+    loss_fn = SigLipLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    print("[Main] Training model...")
+    for epoch in range(10):
+        model.train()
+        total_loss = 0
+        for x, y in tqdm(train_loader):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            optimizer.zero_grad()
+            try:
+                print(f"[Batch] Input shape: {x.shape}")
+                out = model(x)
+                loss = loss_fn(out, y)
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            except Exception as e:
+                print(f"[Error] Skipping batch due to error: {e}")
+
+        avg_loss = total_loss / max(1, len(train_loader))
+        print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
+
+    print("[Main] Evaluating model...")
+    evaluate_model(model, test_loader)
+
 
 # this is a fusion model which chatgpt gave to me i'll see if i can use it
 
