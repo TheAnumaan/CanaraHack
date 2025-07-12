@@ -11,7 +11,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
 
-# Directory path where all user folders (e.g., u00, u01, ...) are located
+# Directory path where all user folders (e.g., 000, 001, ...) are located
 DATA_ROOT = "/path/to/your/user_folders"
 
 class TCNBlock(nn.Module):
@@ -41,6 +41,8 @@ class ModalityEncoder(nn.Module):
         super().__init__()
         self.sensor_type = sensor_type
 
+        print(f"[ModalityEncoder] Initializing encoder for: {sensor_type}")
+
         if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd']:
             self.encoder = TCNBlock(input_dim, hidden_dim)
         elif sensor_type in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
@@ -63,6 +65,7 @@ class ModalityEncoder(nn.Module):
 class MultimodalFusion(nn.Module):
     def __init__(self, modality_dims, fusion_dim=128):
         super().__init__()
+        print(f"[MultimodalFusion] Initializing with modality dims: {modality_dims}")
         self.fusion = nn.Sequential(
             nn.Linear(sum(modality_dims), fusion_dim),
             nn.ReLU()
@@ -95,12 +98,18 @@ class MultimodalSessionDataset(Dataset):
         self.max_len = max_len
         self.sensor_list = sensor_list
 
+        print(f"[Dataset Init] Scanning dataset directory: {root_dir}")
+
         for user_folder in os.listdir(root_dir):
             user_path = os.path.join(root_dir, user_folder)
             if not os.path.isdir(user_path):
                 continue
 
-            user_id = int(user_folder.strip("u"))
+            try:
+                user_id = int(user_folder)
+            except ValueError:
+                continue
+
             data_paths = {
                 'gps': os.path.join(user_path, 'gps.csv'),
                 'wifi': os.path.join(user_path, 'wifi.csv'),
@@ -119,10 +128,13 @@ class MultimodalSessionDataset(Dataset):
                 'sensor_temp': os.path.join(user_path, 'SENSORS', 'sensor_temp.csv')
             }
 
+            print(f"[User Loaded] ID: {user_id}, Path: {user_path}")
             self.samples.append({
                 'user_id': user_id,
                 'paths': data_paths
             })
+
+        print(f"[Dataset Init Complete] Loaded {len(self.samples)} users")
 
     def __len__(self):
         return len(self.samples)
@@ -131,9 +143,11 @@ class MultimodalSessionDataset(Dataset):
         return self._load_sample(self.samples[idx])
 
     def _load_sample(self, sample):
+        print(f"[Sample Load] Loading user {sample['user_id']}")
         tensors = []
         for sensor in self.sensor_list:
             path = sample['paths'].get(sensor)
+            print(f"  [Sensor] {sensor} -> {path}")
             if path and os.path.exists(path):
                 df = pd.read_csv(path, header=None)
                 if sensor == 'gps':
@@ -164,6 +178,7 @@ class MultimodalSessionDataset(Dataset):
                     data = torch.cat([data, pad], dim=0)
                 tensors.append(data)
             else:
+                print(f"    [Warning] Missing file for sensor {sensor}, using zero tensor")
                 tensors.append(torch.zeros(self.max_len, 1))
 
         tensor_stack = torch.stack(tensors)
@@ -181,6 +196,7 @@ class MultimodalEmbeddingModel(nn.Module):
     def forward(self, inputs):
         embeddings = []
         for i, (sensor, encoder) in enumerate(self.encoders.items()):
+            print(f"[Forward] Encoding sensor: {sensor}")
             x = inputs[:, i, :, :]
             embeddings.append(encoder(x))
         return self.fusion(embeddings)
