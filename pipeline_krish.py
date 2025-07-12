@@ -26,6 +26,56 @@ class TCNBlock(nn.Module):
         out = torch.mean(out, dim=2)  # Global average pooling
         return out
 
+class ModalityEncoder(nn.Module):
+    def __init__(self, sensor_type, input_dim, hidden_dim=32):
+        super().__init__()
+        self.sensor_type = sensor_type
+
+        if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd']:
+            self.encoder = TCNBlock(input_dim, hidden_dim)
+        elif sensor_type in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
+            self.encoder = TCNBlock(input_dim, hidden_dim)
+        elif sensor_type == 'wifi':
+            self.encoder = TCNBlock(input_dim, hidden_dim)
+        elif sensor_type == 'bluetooth':
+            self.encoder = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.ReLU()
+            )
+        elif sensor_type == 'key_data':
+            self.encoder = TCNBlock(input_dim, hidden_dim)
+        else:
+            raise ValueError(f"Unknown sensor type: {sensor_type}")
+
+    def forward(self, x):
+        return self.encoder(x)
+
+class MultimodalFusion(nn.Module):
+    def __init__(self, modality_dims, fusion_dim=128):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Linear(sum(modality_dims), fusion_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, embeddings):
+        # embeddings: List of modality tensors [B, D_i]
+        x = torch.cat(embeddings, dim=1)
+        return self.fusion(x)
+
+class SiameseModel(nn.Module):
+    def __init__(self, encoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward_once(self, x):
+        return self.encoder(x)
+
+    def forward(self, x1, x2):
+        embed1 = self.forward_once(x1)
+        embed2 = self.forward_once(x2)
+        return F.cosine_similarity(embed1, embed2)
+
 class CSVSessionDataset(Dataset):
     def __init__(self, root_dir, sensor='gps', max_len=1000):
         self.samples = []
@@ -53,26 +103,20 @@ class CSVSessionDataset(Dataset):
         df = pd.read_csv(sample['csv_path'], header=None)
 
         if self.sensor == 'gps':
-            # Columns: timestamp, orientation, lat, lon, alt, bearing, accuracy
             data = torch.tensor(df.iloc[:, [2, 3, 4, 5, 6]].values, dtype=torch.float)
         elif self.sensor == 'bluetooth':
-            # Columns: timestamp, name, MAC
-            # Use name length and MAC encoded as float (hash-based simple encoding)
             data = df.iloc[:, [1, 2]].astype(str)
             data = torch.tensor([
                 [len(name), float(int("0x" + mac.replace(":", ""), 16) % 1e9)]
                 for name, mac in data.values
             ], dtype=torch.float)
         elif self.sensor == 'wifi':
-            # Columns: timestamp, name, level, info, channel, frequency
             data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
         elif self.sensor.startswith('sensor_'):
-            # Handle all sensor files with common logic
             data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
         elif self.sensor in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
             data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
         elif self.sensor == 'key_data':
-            # Columns: timestamp, field, ASCII code (may be NaN)
             ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
             data = torch.tensor(ascii_vals.values.reshape(-1, 1), dtype=torch.float)
         else:
@@ -86,6 +130,7 @@ class CSVSessionDataset(Dataset):
             data = torch.cat([data, pad], dim=0)
 
         return data, sample['user_id']
+
 # this is a fusion model which chatgpt gave to me i'll see if i can use it
 
 # class MultimodalUserEncoder(nn.Module):
