@@ -15,7 +15,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {DEVICE}")
 
 # Directory path where all user folders (e.g., 000, 001, ...) are located
-DATA_ROOT = "/home/bsnl/Documents/HuMI"
+DATA_ROOT = "/home/krish/Downloads/HuMI"
 
 class TCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
@@ -35,18 +35,19 @@ class TCNBlock(nn.Module):
         self.network = nn.Sequential(*layers)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)  # (B, C, T)
         if x.shape[1] != self.input_dim:
-            print(f"[TCNBlock Warning] Expected {self.input_dim} input channels, but got {x.shape[1]}. Attempting to reshape.")
+            print(f"[TCNBlock Warning] Expected {self.input_dim} input channels, got {x.shape[1]}. Attempting to reshape.")
             if x.shape[1] == 1:
                 x = x.repeat(1, self.input_dim, 1)
                 print(f"[TCNBlock] Repeated single-channel input to {self.input_dim} channels.")
             else:
                 raise ValueError(f"[TCNBlock Error] Cannot match input channels: expected {self.input_dim}, got {x.shape[1]}")
-
-        print(f"[TCNBlock] Processing input with shape: {x.shape}")
-        out = self.network(x)
-        out = torch.mean(out, dim=2)
+        out = self.network(x)  # (B, D_out, T)
+        if out.shape[-1] != 1:
+            out = torch.mean(out, dim=2)  # (B, D_out)
+        else:
+            out = out.view(out.size(0), -1)
         return out
 
 class ModalityEncoder(nn.Module):
@@ -88,6 +89,8 @@ class MultimodalFusion(nn.Module):
         )
 
     def forward(self, embeddings):
+        for i, e in enumerate(embeddings):
+            print(f"[Fusion] Embedding {i} shape: {e.shape}")
         x = torch.cat(embeddings, dim=1)
         return self.fusion(x)
 
@@ -127,9 +130,6 @@ class MultimodalSessionDataset(Dataset):
                 continue
 
             data_paths = {
-                'gps': os.path.join(user_path, 'gps.csv'),
-                'wifi': os.path.join(user_path, 'wifi.csv'),
-                'bluetooth': os.path.join(user_path, 'bluetooth.csv'),
                 'key_data': os.path.join(user_path, 'KEYSTROKE', 'key_data.csv'),
                 'swipe': os.path.join(user_path, 'TOUCH', 'swipe.csv'),
                 'f_0_touch': os.path.join(user_path, 'TOUCH', 'f_0_touch.csv'),
@@ -166,17 +166,7 @@ class MultimodalSessionDataset(Dataset):
             print(f"  [Sensor] {sensor} -> {path}")
             if path and os.path.exists(path):
                 df = pd.read_csv(path, header=None)
-                if sensor == 'gps':
-                    data = torch.tensor(df.iloc[:, [2, 3, 4, 5, 6]].values, dtype=torch.float)
-                elif sensor == 'bluetooth':
-                    data = df.iloc[:, [1, 2]].astype(str)
-                    data = torch.tensor([
-                        [len(name), float(int("0x" + mac.replace(":", ""), 16) % 1e9)]
-                        for name, mac in data.values
-                    ], dtype=torch.float)
-                elif sensor == 'wifi':
-                    data = torch.tensor(df.iloc[:, [2, 4, 5]].values, dtype=torch.float)
-                elif sensor.startswith('sensor_'):
+                if sensor.startswith('sensor_'):
                     data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
                 elif sensor in ['swipe', 'f_0_touch']:
                     data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
@@ -289,23 +279,29 @@ DataLoaderMP = lambda dataset, batch_size, shuffle=True: DataLoader(
 from torch.utils.data import random_split
 from tqdm import tqdm
 
-def split_dataset_by_user(dataset, test_ratio=0.2):
-    user_ids = list(set([s['user_id'] for s in dataset.samples]))
+def split_dataset_by_user(dataset, test_ratio=0.2, min_test_users=2):
+    user_ids = list({s['user_id'] for s in dataset.samples})
     user_ids.sort()
-    n_test = int(len(user_ids) * test_ratio)
-    test_ids = set(user_ids[-n_test:])
-    train_ids = set(user_ids[:-n_test])
 
-    train_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in train_ids]
-    test_indices = [i for i, s in enumerate(dataset.samples) if s['user_id'] in test_ids]
+    if len(user_ids) < min_test_users + 1:
+        raise ValueError(f"Need at least {min_test_users + 1} users to split. Found only {len(user_ids)}.")
 
-    return Subset(dataset, train_indices), Subset(dataset, test_indices)
+    # Use train_test_split to randomly select test users
+    test_size = max(min_test_users, int(len(user_ids) * test_ratio))
+    train_users, test_users = train_test_split(user_ids, test_size=test_size, random_state=42)
+
+    train_idx = [i for i, s in enumerate(dataset.samples) if s['user_id'] in train_users]
+    test_idx = [i for i, s in enumerate(dataset.samples) if s['user_id'] in test_users]
+
+    return Subset(dataset, train_idx), Subset(dataset, test_idx)
+
 
 def evaluate_model(model, dataloader):
     print("[Eval] Computing embeddings and similarities...")
     model.eval()
     embeddings = []
     labels = []
+
     with torch.no_grad():
         for x, y in tqdm(dataloader):
             x, y = x.cuda(), y.cuda()
@@ -316,6 +312,10 @@ def evaluate_model(model, dataloader):
     embeddings = torch.cat(embeddings, dim=0)
     labels = torch.cat(labels, dim=0)
 
+    if len(labels.unique()) < 2:
+        print("[ERROR] Only one user present in evaluation set. Skipping evaluation.")
+        return None, None
+
     # Compute pairwise cosine similarities
     sims = torch.matmul(F.normalize(embeddings, dim=1), F.normalize(embeddings, dim=1).T)
     same_user = labels.unsqueeze(0) == labels.unsqueeze(1)
@@ -323,19 +323,27 @@ def evaluate_model(model, dataloader):
 
     y_true = same_user[mask].cpu().numpy().astype(int)
     y_score = sims[mask].cpu().numpy()
+
+    print(f"[Eval] y_true distribution: {np.bincount(y_true)}")
+
+    if np.all(y_true == 0) or np.all(y_true == 1):
+        print("[WARN] Only one class in similarity labels. Skipping AUC/EER.")
+        return None, None
+
+    from sklearn.metrics import roc_curve, roc_auc_score
     fpr, tpr, _ = roc_curve(y_true, y_score)
-    auc = roc_auc_score(y_true, y_score)
     eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
+    auc = roc_auc_score(y_true, y_score)
 
     print(f"[Eval] AUC: {auc:.4f}, EER: {eer:.4f}")
     return auc, eer
 
 
 if __name__ == "__main__":
-    DATA_ROOT = "/home/bsnl/Documents/HuMI"
+    DATA_ROOT = "/home/krish/Downloads/HuMI/"
 
     sensor_list = [
-        'gps', 'wifi', 'bluetooth', 'key_data', 'swipe', 'f_X_touch',
+        'key_data', 'swipe', 'f_X_touch',
         'sensor_grav', 'sensor_gyro', 'sensor_humd', 'sensor_lacc',
         'sensor_ligh', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp'
     ]
@@ -351,7 +359,7 @@ if __name__ == "__main__":
 
     print("[Main] Building model...")
     sensor_dims = {
-        'gps': 5, 'wifi': 3, 'bluetooth': 2, 'key_data': 1, 'swipe': 4, 'f_X_touch': 4,
+        'key_data': 1, 'swipe': 4, 'f_X_touch': 4,
         'sensor_grav': 3, 'sensor_gyro': 3, 'sensor_humd': 3, 'sensor_lacc': 3,
         'sensor_ligh': 1, 'sensor_magn': 3, 'sensor_nacc': 3, 'sensor_prox': 1, 'sensor_temp': 1
     }
