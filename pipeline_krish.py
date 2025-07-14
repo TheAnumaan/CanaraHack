@@ -102,7 +102,6 @@ class MultimodalEmbeddingModel(nn.Module):
         })
         self.fusion = MultimodalFusion([hidden_dim] * len(sensors))
 
-
     def forward(self, inputs):
         embeddings = []
         for i, (sensor, encoder) in enumerate(self.encoders.items()):
