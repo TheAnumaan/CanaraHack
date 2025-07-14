@@ -10,6 +10,7 @@ from multiprocessing import cpu_count
 from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import train_test_split
+import glob
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {DEVICE}")
@@ -41,7 +42,7 @@ class ModalityEncoder(nn.Module):
     def __init__(self, sensor_type, input_dim, hidden_dim=32):
         super().__init__()
         self.sensor_type = sensor_type
-        print(f"[ModalityEncoder] Initializing encoder for: {sensor_type}")
+        print(f"[ModalityEncoder] Initializing encoder for: {sensor_type}, input_dim={input_dim}")
 
         if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn',
                            'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd',
@@ -111,6 +112,8 @@ class MultimodalEmbeddingModel(nn.Module):
         return self.fusion(embeddings)
 
 
+import glob
+
 class MultimodalSessionDataset(Dataset):
     def __init__(self, root_dir, sensor_list, max_len=1000):
         self.samples = []
@@ -134,11 +137,17 @@ class MultimodalSessionDataset(Dataset):
                 if not os.path.isdir(session_path):
                     continue
 
-                # Paths to individual sensor files inside the session
+                # Find all f_X_touch files (like f_0_touch.csv, f_1_touch.csv, ...)
+                touch_folder = os.path.join(session_path, 'TOUCH')
+                f_touch_files = sorted(glob.glob(os.path.join(touch_folder, 'f_*_touch.csv')))
+                
+                # You can choose a specific one (e.g., f_0_touch) or aggregate later
+                selected_touch_file = f_touch_files[0] if f_touch_files else None
+
                 data_paths = {
                     'key_data': os.path.join(session_path, 'KEYSTROKE', 'key_data.csv'),
                     'swipe': os.path.join(session_path, 'TOUCH', 'swipe.csv'),
-                    'f_0_touch': os.path.join(session_path, 'TOUCH', 'f_0_touch.csv'),
+                    'f_X_touch': selected_touch_file,
                     'sensor_grav': os.path.join(session_path, 'SENSORS', 'sensor_grav.csv'),
                     'sensor_gyro': os.path.join(session_path, 'SENSORS', 'sensor_gyro.csv'),
                     'sensor_humd': os.path.join(session_path, 'SENSORS', 'sensor_humd.csv'),
@@ -174,7 +183,7 @@ class MultimodalSessionDataset(Dataset):
                 df = pd.read_csv(path, header=None)
                 if sensor.startswith('sensor_'):
                     data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
-                elif sensor in ['swipe', 'f_0_touch']:
+                elif sensor in ['swipe', 'f_X_touch']:
                     raw_data = df.iloc[:, 2:6]
                     numeric_data = raw_data.apply(pd.to_numeric, errors='coerce').fillna(0).astype(np.float32)
                     data = torch.tensor(numeric_data.values)
@@ -195,7 +204,6 @@ class MultimodalSessionDataset(Dataset):
                 print(f"    [Warning] Missing file for sensor {sensor}, using zero tensor")
                 tensors.append(torch.zeros(self.max_len, 1))
 
-        # Make all tensors have same shape [max_len, max_dim]
         max_dim = max(t.shape[1] for t in tensors)
         padded = []
         for t in tensors:
@@ -204,8 +212,9 @@ class MultimodalSessionDataset(Dataset):
                 t = torch.cat([t, pad], dim=1)
             padded.append(t)
 
-        tensor_stack = torch.stack(padded)  # Now all shape: [max_len, max_dim]
+        tensor_stack = torch.stack(padded)  # [num_sensors, max_len, max_dim]
         return tensor_stack, sample['user_id']
+
 
 # Training + Evaluation
 
