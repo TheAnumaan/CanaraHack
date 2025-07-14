@@ -111,6 +111,25 @@ class SigLipLoss(nn.Module):
         loss = F.binary_cross_entropy(sim_scores, label_matrix)
         return loss
 
+class MultimodalEmbeddingModel(nn.Module):
+    def __init__(self, sensors, input_dim, hidden_dim=32):
+        super().__init__()
+        self.encoders = nn.ModuleDict({
+            sensor: ModalityEncoder(sensor, input_dim, hidden_dim)
+            for sensor in sensors
+        })
+        self.fusion = MultimodalFusion([hidden_dim] * len(sensors))
+
+
+    def forward(self, inputs):
+        embeddings = []
+        for i, (sensor, encoder) in enumerate(self.encoders.items()):
+            print(f"[Forward] Encoding sensor: {sensor}")
+            x = inputs[:, i, :, :]  # shape: (B, T, D)
+            embeddings.append(encoder(x))
+        return self.fusion(embeddings)
+
+
 class MultimodalSessionDataset(Dataset):
     def __init__(self, root_dir, sensor_list, max_len=1000):
         self.samples = []
@@ -129,28 +148,34 @@ class MultimodalSessionDataset(Dataset):
             except ValueError:
                 continue
 
-            data_paths = {
-                'key_data': os.path.join(user_path, 'KEYSTROKE', 'key_data.csv'),
-                'swipe': os.path.join(user_path, 'TOUCH', 'swipe.csv'),
-                'f_0_touch': os.path.join(user_path, 'TOUCH', 'f_0_touch.csv'),
-                'sensor_grav': os.path.join(user_path, 'SENSORS', 'sensor_grav.csv'),
-                'sensor_gyro': os.path.join(user_path, 'SENSORS', 'sensor_gyro.csv'),
-                'sensor_humd': os.path.join(user_path, 'SENSORS', 'sensor_humd.csv'),
-                'sensor_lacc': os.path.join(user_path, 'SENSORS', 'sensor_lacc.csv'),
-                'sensor_ligh': os.path.join(user_path, 'SENSORS', 'sensor_ligh.csv'),
-                'sensor_magn': os.path.join(user_path, 'SENSORS', 'sensor_magn.csv'),
-                'sensor_nacc': os.path.join(user_path, 'SENSORS', 'sensor_nacc.csv'),
-                'sensor_prox': os.path.join(user_path, 'SENSORS', 'sensor_prox.csv'),
-                'sensor_temp': os.path.join(user_path, 'SENSORS', 'sensor_temp.csv')
-            }
+            for session_folder in os.listdir(user_path):
+                session_path = os.path.join(user_path, session_folder)
+                if not os.path.isdir(session_path):
+                    continue
 
-            print(f"[User Loaded] ID: {user_id}, Path: {user_path}")
-            self.samples.append({
-                'user_id': user_id,
-                'paths': data_paths
-            })
+                # Paths to individual sensor files inside the session
+                data_paths = {
+                    'key_data': os.path.join(session_path, 'KEYSTROKE', 'key_data.csv'),
+                    'swipe': os.path.join(session_path, 'TOUCH', 'swipe.csv'),
+                    'f_0_touch': os.path.join(session_path, 'TOUCH', 'f_0_touch.csv'),
+                    'sensor_grav': os.path.join(session_path, 'SENSORS', 'sensor_grav.csv'),
+                    'sensor_gyro': os.path.join(session_path, 'SENSORS', 'sensor_gyro.csv'),
+                    'sensor_humd': os.path.join(session_path, 'SENSORS', 'sensor_humd.csv'),
+                    'sensor_lacc': os.path.join(session_path, 'SENSORS', 'sensor_lacc.csv'),
+                    'sensor_ligh': os.path.join(session_path, 'SENSORS', 'sensor_ligh.csv'),
+                    'sensor_magn': os.path.join(session_path, 'SENSORS', 'sensor_magn.csv'),
+                    'sensor_nacc': os.path.join(session_path, 'SENSORS', 'sensor_nacc.csv'),
+                    'sensor_prox': os.path.join(session_path, 'SENSORS', 'sensor_prox.csv'),
+                    'sensor_temp': os.path.join(session_path, 'SENSORS', 'sensor_temp.csv')
+                }
 
-        print(f"[Dataset Init Complete] Loaded {len(self.samples)} users")
+                self.samples.append({
+                    'user_id': user_id,
+                    'session_id': session_folder,
+                    'paths': data_paths
+                })
+
+        print(f"[Dataset Init Complete] Loaded {len(self.samples)} sessions across users")
 
     def __len__(self):
         return len(self.samples)
@@ -169,7 +194,9 @@ class MultimodalSessionDataset(Dataset):
                 if sensor.startswith('sensor_'):
                     data = torch.tensor(df.iloc[:, 2:].values, dtype=torch.float)
                 elif sensor in ['swipe', 'f_0_touch']:
-                    data = torch.tensor(df.iloc[:, 2:6].values, dtype=torch.float)
+                    raw_data = df.iloc[:, 2:6]
+                    numeric_data = raw_data.apply(pd.to_numeric, errors='coerce').fillna(0).astype(np.float32)
+                    data = torch.tensor(numeric_data.values)
                 elif sensor == 'key_data':
                     ascii_vals = pd.to_numeric(df.iloc[:, 2], errors='coerce').fillna(0)
                     data = torch.tensor(ascii_vals.values.reshape(-1, 1), dtype=torch.float)
@@ -187,25 +214,19 @@ class MultimodalSessionDataset(Dataset):
                 print(f"    [Warning] Missing file for sensor {sensor}, using zero tensor")
                 tensors.append(torch.zeros(self.max_len, 1))
 
-        tensor_stack = torch.stack(tensors)
+        # Make all tensors have same shape [max_len, max_dim]
+        max_dim = max(t.shape[1] for t in tensors)
+        padded = []
+        for t in tensors:
+            if t.shape[1] < max_dim:
+                pad = torch.zeros(t.shape[0], max_dim - t.shape[1])
+                t = torch.cat([t, pad], dim=1)
+            padded.append(t)
+
+        tensor_stack = torch.stack(padded)  # Now all shape: [max_len, max_dim]
         return tensor_stack, sample['user_id']
 
-class MultimodalEmbeddingModel(nn.Module):
-    def __init__(self, sensor_dims, hidden_dim=32, fusion_dim=128):
-        super().__init__()
-        self.encoders = nn.ModuleDict({
-            sensor: ModalityEncoder(sensor, dim, hidden_dim)
-            for sensor, dim in sensor_dims.items()
-        })
-        self.fusion = MultimodalFusion([hidden_dim for _ in sensor_dims])
 
-    def forward(self, inputs):
-        embeddings = []
-        for i, (sensor, encoder) in enumerate(self.encoders.items()):
-            print(f"[Forward] Encoding sensor: {sensor}")
-            x = inputs[:, i, :, :]
-            embeddings.append(encoder(x))
-        return self.fusion(embeddings)
 
 # Training + Evaluation
 
@@ -364,12 +385,12 @@ if __name__ == "__main__":
         'sensor_ligh': 1, 'sensor_magn': 3, 'sensor_nacc': 3, 'sensor_prox': 1, 'sensor_temp': 1
     }
 
-    model = MultimodalEmbeddingModel(sensor_dims).to(DEVICE)
+    model = MultimodalEmbeddingModel(sensor_list, input_dim=4).to(DEVICE)
     loss_fn = SigLipLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     print("[Main] Training model...")
-    for epoch in range(10):
+    for epoch in range(40):
         model.train()
         total_loss = 0
         for x, y in tqdm(train_loader):
@@ -390,48 +411,3 @@ if __name__ == "__main__":
 
     print("[Main] Evaluating model...")
     evaluate_model(model, test_loader)
-
-
-# this is a fusion model which chatgpt gave to me i'll see if i can use it
-
-# class MultimodalUserEncoder(nn.Module):
-#     def __init__(self, dims):
-#         super().__init__()
-#         self.gps_tcn       = TCNBlock(input_dim=dims['gps'], output_dim=32)
-#         self.wifi_tcn      = TCNBlock(input_dim=dims['wifi'], output_dim=32)
-#         self.keystroke_tcn = TCNBlock(input_dim=dims['keystroke'], output_dim=64)
-#         # Add more modalities here
-
-#     def forward(self, gps_seq, wifi_seq, keystroke_seq):
-#         gps_embed       = self.gps_tcn(gps_seq)        # shape: (B, 32)
-#         wifi_embed      = self.wifi_tcn(wifi_seq)       # shape: (B, 32)
-#         keystroke_embed = self.keystroke_tcn(keystroke_seq)  # shape: (B, 64)
-
-#         # Concatenate all modality embeddings
-#         user_vector = torch.cat([gps_embed, wifi_embed, keystroke_embed], dim=1)  # shape: (B, 128)
-#         return user_vector
-
-# this is a profile viewer chatgpt gave to me
-# def create_user_profile(model, user_sessions):
-#     # user_sessions: list of dicts {modality_name: Tensor} of shape (T, D)
-#     vectors = []
-#     for session in user_sessions:
-#         # Add batch dim
-#         gps = session['gps'].unsqueeze(0)
-#         wifi = session['wifi'].unsqueeze(0)
-#         keys = session['keystroke'].unsqueeze(0)
-#         with torch.no_grad():
-#             vec = model(gps, wifi, keys)  # shape: (1, D)
-#         vectors.append(vec.squeeze(0))    # shape: (D,)
-#     return torch.stack(vectors).mean(dim=0)  # Averaged profile vector (D,)
-
-# for comparing to a new session
-# def verify_user(model, session, stored_vector, threshold=0.8):
-#     gps = session['gps'].unsqueeze(0)
-#     wifi = session['wifi'].unsqueeze(0)
-#     keys = session['keystroke'].unsqueeze(0)
-    
-#     with torch.no_grad():
-#         vec = model(gps, wifi, keys)  # shape: (1, D)
-#         score = F.cosine_similarity(vec, stored_vector.unsqueeze(0))  # shape: (1,)
-#     return score.item() > threshold, score.item()
