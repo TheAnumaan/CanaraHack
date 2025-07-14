@@ -17,59 +17,41 @@ print(f"[INFO] Using device: {DEVICE}")
 # Directory path where all user folders (e.g., 000, 001, ...) are located
 DATA_ROOT = "/home/krish/Downloads/HuMI"
 
-class TCNBlock(nn.Module):
+class ResidualTCNBlock(nn.Module):
     def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
         super().__init__()
-        layers = []
-        self.input_dim = input_dim
+        self.layers = nn.ModuleList()
         for i in range(num_layers):
             dilation = 2 ** i
-            layers.append(nn.Conv1d(
-                in_channels=input_dim if i == 0 else output_dim,
-                out_channels=output_dim,
-                kernel_size=kernel_size,
-                padding=(kernel_size - 1) * dilation,
-                dilation=dilation
+            self.layers.append(nn.Sequential(
+                nn.Conv1d(input_dim if i == 0 else output_dim, output_dim, kernel_size,
+                          padding=(kernel_size - 1) * dilation, dilation=dilation),
+                nn.ReLU()
             ))
-            layers.append(nn.ReLU())
-        self.network = nn.Sequential(*layers)
+        self.proj = nn.Conv1d(input_dim, output_dim, 1) if input_dim != output_dim else nn.Identity()
 
     def forward(self, x):
         x = x.permute(0, 2, 1)  # (B, C, T)
-        if x.shape[1] != self.input_dim:
-            print(f"[TCNBlock Warning] Expected {self.input_dim} input channels, got {x.shape[1]}. Attempting to reshape.")
-            if x.shape[1] == 1:
-                x = x.repeat(1, self.input_dim, 1)
-                print(f"[TCNBlock] Repeated single-channel input to {self.input_dim} channels.")
-            else:
-                raise ValueError(f"[TCNBlock Error] Cannot match input channels: expected {self.input_dim}, got {x.shape[1]}")
-        out = self.network(x)  # (B, D_out, T)
-        if out.shape[-1] != 1:
-            out = torch.mean(out, dim=2)  # (B, D_out)
-        else:
-            out = out.view(out.size(0), -1)
-        return out
+        out = self.proj(x)
+        for layer in self.layers:
+            out = out + layer(out)
+        return torch.mean(out, dim=2)  # (B, D_out)
 
 class ModalityEncoder(nn.Module):
     def __init__(self, sensor_type, input_dim, hidden_dim=32):
         super().__init__()
         self.sensor_type = sensor_type
-
         print(f"[ModalityEncoder] Initializing encoder for: {sensor_type}")
 
-        if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd']:
-            self.encoder = TCNBlock(input_dim, hidden_dim)
-        elif sensor_type in ['swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch']:
-            self.encoder = TCNBlock(input_dim, hidden_dim)
-        elif sensor_type == 'wifi':
-            self.encoder = TCNBlock(input_dim, hidden_dim)
+        if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn',
+                           'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd',
+                           'swipe', 'scroll_X_touch', 'touch_touch', 'f_X_touch', 'key_data', 'wifi']:
+            self.encoder = ResidualTCNBlock(input_dim, hidden_dim)
         elif sensor_type == 'bluetooth':
             self.encoder = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
                 nn.ReLU()
             )
-        elif sensor_type == 'key_data':
-            self.encoder = TCNBlock(input_dim, hidden_dim)
         else:
             raise ValueError(f"Unknown sensor type: {sensor_type}")
 
@@ -112,10 +94,10 @@ class SigLipLoss(nn.Module):
         return loss
 
 class MultimodalEmbeddingModel(nn.Module):
-    def __init__(self, sensors, input_dim, hidden_dim=32):
+    def __init__(self, sensors, input_dim: dict, hidden_dim=32):
         super().__init__()
         self.encoders = nn.ModuleDict({
-            sensor: ModalityEncoder(sensor, input_dim, hidden_dim)
+            sensor: ModalityEncoder(sensor, input_dim[sensor], hidden_dim)
             for sensor in sensors
         })
         self.fusion = MultimodalFusion([hidden_dim] * len(sensors))
@@ -225,8 +207,6 @@ class MultimodalSessionDataset(Dataset):
 
         tensor_stack = torch.stack(padded)  # Now all shape: [max_len, max_dim]
         return tensor_stack, sample['user_id']
-
-
 
 # Training + Evaluation
 
@@ -359,6 +339,31 @@ def evaluate_model(model, dataloader):
     print(f"[Eval] AUC: {auc:.4f}, EER: {eer:.4f}")
     return auc, eer
 
+def balanced_similarity_scores(embeddings, labels):
+    from sklearn.metrics import roc_auc_score, roc_curve
+    labels = labels.cpu()
+    embeddings = embeddings.cpu()
+
+    same_user_mask = (labels.unsqueeze(1) == labels.unsqueeze(0))
+    sims = F.cosine_similarity(embeddings.unsqueeze(1), embeddings.unsqueeze(0), dim=2)
+
+    # Only consider off-diagonal pairs
+    mask = ~torch.eye(len(labels), dtype=torch.bool)
+    pos_pairs = sims[same_user_mask & mask]
+    neg_pairs = sims[~same_user_mask & mask]
+
+    n = min(len(pos_pairs), len(neg_pairs))
+    pos_sample = pos_pairs[:n]
+    neg_sample = neg_pairs[:n]
+
+    y_true = np.array([1] * n + [0] * n)
+    y_score = np.concatenate([pos_sample.numpy(), neg_sample.numpy()])
+
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    auc = roc_auc_score(y_true, y_score)
+    eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
+
+    return auc, eer
 
 if __name__ == "__main__":
     DATA_ROOT = "/home/krish/Downloads/HuMI/"
@@ -385,29 +390,25 @@ if __name__ == "__main__":
         'sensor_ligh': 1, 'sensor_magn': 3, 'sensor_nacc': 3, 'sensor_prox': 1, 'sensor_temp': 1
     }
 
-    model = MultimodalEmbeddingModel(sensor_list, input_dim=4).to(DEVICE)
+    model = MultimodalEmbeddingModel(sensor_list, input_dim=sensor_dims).to(DEVICE)
     loss_fn = SigLipLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    print("[Main] Training model...")
-    for epoch in range(40):
-        model.train()
-        total_loss = 0
-        for x, y in tqdm(train_loader):
-            x, y = x.to(DEVICE), y.to(DEVICE)
-            optimizer.zero_grad()
-            try:
-                print(f"[Batch] Input shape: {x.shape}")
-                out = model(x)
-                loss = loss_fn(out, y)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            except Exception as e:
-                print(f"[Error] Skipping batch due to error: {e}")
-
-        avg_loss = total_loss / max(1, len(train_loader))
-        print(f"[Epoch {epoch+1}] Loss: {avg_loss:.4f}")
-
     print("[Main] Evaluating model...")
-    evaluate_model(model, test_loader)
+    model.eval()
+    embeddings = []
+    labels = []
+
+    with torch.no_grad():
+        for x, y in tqdm(test_loader):
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            emb = model(x)
+            embeddings.append(emb)
+            labels.append(y)
+
+    embeddings = torch.cat(embeddings, dim=0)
+    labels = torch.cat(labels, dim=0)
+
+    auc, eer = balanced_similarity_scores(embeddings, labels)
+
+    print(f"[Eval - Balanced] AUC: {auc:.4f}, EER: {eer:.4f}")
