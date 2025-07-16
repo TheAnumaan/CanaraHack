@@ -21,7 +21,7 @@ print(f"[INFO] Using device: {DEVICE}")
 DATA_ROOT = "/home/krish/Downloads/HuMI/"
 
 class TCNBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3):
+    def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3, sequence_length=1000):
         super().__init__()
         self.input_dim = input_dim
         layers = []
@@ -35,50 +35,45 @@ class TCNBlock(nn.Module):
                 dilation=2 ** i
             ))
             layers.append(nn.ReLU())
-            layers.append(nn.Dropout(0.3))  # Add after ReLU or before BatchNorm
-
             layers.append(nn.BatchNorm1d(output_dim))
+            layers.append(nn.Dropout(0.3))
+
         self.network = nn.Sequential(*layers)
+        
+        # --- THIS IS THE FIX ---
+        # Dynamically determine the flattened size by doing a dummy forward pass.
+        # This is robust to changes in padding, kernel size, etc.
+        with torch.no_grad():
+            # Create a dummy tensor with the expected input shape: (Batch, Channels, Length)
+            dummy_input = torch.zeros(1, input_dim, sequence_length)
+            # Pass it through the convolutional network
+            dummy_output = self.network(dummy_input)
+            # Get the size of the flattened output
+            flattened_size = dummy_output.flatten(1).shape[1]
+            
+        # Create the projection layer with the correctly calculated input size
+        self.project = nn.Linear(flattened_size, output_dim)
 
     def forward(self, x):
-        x = x.permute(0, 2, 1)  # (B, D, T)
-        if x.shape[1] != self.input_dim:
-            print(f"[TCNBlock Warning] Reshaping from {x.shape[1]} to {self.input_dim}")
-            if x.shape[1] > self.input_dim:
-                x = x[:, :self.input_dim, :]  # Truncate channels
-            else:
-                pad = torch.zeros(x.size(0), self.input_dim - x.shape[1], x.size(2)).to(x.device)
-                x = torch.cat([x, pad], dim=1)
-        out = self.network(x)
-        return torch.mean(out, dim=2)
+        # x is (B, T, D)
+        x = x.permute(0, 2, 1)  # Permute to (B, D, T) for Conv1d
+
+        conv_out = self.network(x) # Output shape: (B, output_dim, T_new)
+        
+        # Flatten channels and time, then project to the final embedding size
+        flattened = conv_out.flatten(start_dim=1)
+        out = self.project(flattened)
+        
+        return out
 
 
 class ModalityEncoder(nn.Module):
-    def __init__(self, sensor_type, input_dim, hidden_dim=32):
+    def __init__(self, sensor_type, input_dim, hidden_dim=64, sequence_length=1000):
         super().__init__()
         self.sensor_type = sensor_type
-
-        if sensor_type in ['gps', 'sensor_grav', 'sensor_gyro', 'sensor_lacc', 'sensor_magn',
-                           'sensor_nacc', 'sensor_prox', 'sensor_temp', 'sensor_ligh', 'sensor_humd',
-                           'swipe', 'f_X_touch', 'key_data','touch_touch']:
-            self.encoder = TCNBlock(input_dim, output_dim=64, num_layers=4)
-
-
-        elif sensor_type == 'bluetooth':
-            self.encoder = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU()
-            )
-        elif sensor_type == 'wifi':
-            self.encoder = TCNBlock(input_dim, output_dim=64, num_layers=4)
-
-
-        else:
-            raise ValueError(f"Unknown sensor type: {sensor_type}")
+        self.encoder = TCNBlock(input_dim, output_dim=hidden_dim, num_layers=4, sequence_length=sequence_length)
 
     def forward(self, x):
-        if isinstance(self.encoder, nn.Sequential):
-            x = torch.mean(x, dim=1)
         return self.encoder(x)
 
 
@@ -114,20 +109,29 @@ class SigLipLoss(nn.Module):
         loss = F.binary_cross_entropy(sim_scores, label_matrix)
         return loss
 class MultimodalEmbeddingModel(nn.Module):
-    def __init__(self, sensors, sensor_dims, hidden_dim=64, proj_dim=64): # Note: hidden_dim is now the TCN output
+    def __init__(self, sensors, sensor_dims, hidden_dim=64, proj_dim=64, sequence_length=1000):
         super().__init__()
+        # Calculate the true input dimension for each TCN based on the dataset's max feature padding
+        # This makes the model more robust if the sensor list changes.
+        max_feature_dim = max(sensor_dims.values())
+        
         self.encoders = nn.ModuleDict({
-            sensor: ModalityEncoder(sensor, input_dim=sensor_dims.get(sensor, 1), hidden_dim=hidden_dim)
+            sensor: ModalityEncoder(sensor,
+                                   input_dim=max_feature_dim, # All encoders receive the same padded dimension
+                                   hidden_dim=hidden_dim,
+                                   sequence_length=sequence_length)
             for sensor in sensors
         })
 
-        # --- THIS IS THE CRITICAL FIX ---
-        # The TCN encoders output `hidden_dim`. The total dimension for the fusion
-        # layer is the sum of all these output dimensions.
+        # The fusion layer input is the sum of all encoder outputs
         fusion_input_dim = hidden_dim * len(sensors)
-        self.fusion = MultimodalFusion(modality_dims=[fusion_input_dim], fusion_dim=128) # Pass a single value
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5)
+        )
 
-        # 🔥 Projection Head
+        # Projection Head for contrastive loss
         self.projection = nn.Sequential(
             nn.Linear(128, 128),
             nn.ReLU(),
@@ -135,12 +139,13 @@ class MultimodalEmbeddingModel(nn.Module):
         )
 
     def forward(self, inputs):
+        # The dataloader now produces tensors of shape (B, num_modalities, T, D_max)
         embeddings = []
-        for i, (sensor, encoder) in enumerate(self.encoders.items()):
-            x = inputs[:, i, :, :]  # (B, T, D)
-            embeddings.append(encoder(x))
+        for i, sensor in enumerate(self.encoders.keys()):
+            # Pass the corresponding modality slice to its encoder
+            x = inputs[:, i, :, :]  # (B, T, D_max)
+            embeddings.append(self.encoders[sensor](x))
         
-        # Concatenate embeddings before passing to the fusion layer
         fused_input = torch.cat(embeddings, dim=1)
         fused = self.fusion(fused_input)
         return self.projection(fused)
@@ -583,70 +588,77 @@ class TripletWrapper(Dataset):
         return anchor_data, pos_data, neg_data
 
 if __name__ == "__main__":
-    DATA_ROOT = "/home/krish/Downloads/HuMI"
+    # --- Configuration ---
+    MAX_LEN = 1000
+    NUM_EPOCHS = 30 # Increased epochs
+    BATCH_SIZE = 16
+    LEARNING_RATE = 1e-4
 
     sensor_list = [
-        'key_data', 'swipe', 'f_X_touch', 'touch_touch',
-        'sensor_grav', 'sensor_gyro', 'sensor_humd', 'sensor_lacc',
-        'sensor_ligh', 'sensor_magn', 'sensor_nacc', 'sensor_prox', 'sensor_temp'
+        'key_data', 'swipe', 'touch_touch', 'sensor_grav', 'sensor_gyro', 
+        'sensor_lacc', 'sensor_magn', 'sensor_nacc' # A smaller, more focused list can help
     ]
+    
+    # These dims are for reference; the model now uses the max dim automatically
+    sensor_dims = {
+        'key_data': 1, 'swipe': 6, 'touch_touch': 6, # Corrected to 6
+        'sensor_grav': 3, 'sensor_gyro': 3, 'sensor_lacc': 3,
+        'sensor_magn': 3, 'sensor_nacc': 3
+    }
 
+    # --- Data Loading ---
     print("[Main] Creating dataset...")
-    dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list)
-    print(f"[Main] Total users in dataset: {len(dataset)}")
-
+    dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list, max_len=MAX_LEN)
+    
     print("[Main] Splitting train/test users...")
     train_dataset, test_dataset = split_dataset_by_user(dataset)
 
-    from torch.utils.data import DataLoader
-    import random
-
-    
-
     triplet_train_dataset = TripletWrapper(train_dataset)
-    triplet_loader = DataLoader(triplet_train_dataset, batch_size=16, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=4)
+    triplet_loader = DataLoader(triplet_train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
+    # --- Model Initialization ---
     print("[Main] Building model...")
+    model = MultimodalEmbeddingModel(
+        sensors=sensor_list,
+        sensor_dims=sensor_dims,
+        hidden_dim=64,
+        proj_dim=64,
+        sequence_length=MAX_LEN
+    ).to(DEVICE)
+    
+    loss_fn = nn.TripletMarginLoss(margin=0.5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
-    sensor_dims = {
-        'key_data': 1, 'swipe': 4, 'f_X_touch': 4, 'touch_touch': 4,
-        'sensor_grav': 3, 'sensor_gyro': 3, 'sensor_humd': 3, 'sensor_lacc': 3,
-        'sensor_ligh': 1, 'sensor_magn': 3, 'sensor_nacc': 3, 'sensor_prox': 1, 'sensor_temp': 1
-    }
-
-    model = MultimodalEmbeddingModel(sensors=sensor_list, sensor_dims=sensor_dims, hidden_dim=64).to(DEVICE)
-
-    loss_fn = nn.TripletMarginLoss(margin=0.5, p=2)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40)
-
-    print("[Main] Training model with Triplet Loss...")
-    for epoch in range(5):
+    # --- Training Loop ---
+    print(f"[Main] Training for {NUM_EPOCHS} epochs...")
+    for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
-        for anchor, positive, negative in tqdm(triplet_loader):
-            anchor = anchor.to(DEVICE)
-            positive = positive.to(DEVICE)
-            negative = negative.to(DEVICE)
+        
+        # Use tqdm for progress bar
+        progress_bar = tqdm(triplet_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
+        for anchor, positive, negative in progress_bar:
+            anchor, positive, negative = anchor.to(DEVICE), positive.to(DEVICE), negative.to(DEVICE)
 
             optimizer.zero_grad()
-            try:
-                anchor_emb = F.normalize(model(anchor), dim=1)
-                pos_emb = F.normalize(model(positive), dim=1)
-                neg_emb = F.normalize(model(negative), dim=1)
+            
+            anchor_emb = F.normalize(model(anchor))
+            pos_emb = F.normalize(model(positive))
+            neg_emb = F.normalize(model(negative))
 
-                loss = loss_fn(anchor_emb, pos_emb, neg_emb)
-                loss.backward()
-                optimizer.step()
-                total_loss += loss.item()
-            except Exception as e:
-                print(f"[Error] Skipping triplet due to error: {e}")
+            loss = loss_fn(anchor_emb, pos_emb, neg_emb)
+            loss.backward()
+            optimizer.step()
+            
+            total_loss += loss.item()
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
-        avg_loss = total_loss / max(1, len(triplet_loader))
-        print(f"[Epoch {epoch+1}] Triplet Loss: {avg_loss:.4f}")
+        avg_loss = total_loss / len(triplet_loader)
+        print(f"** End of Epoch {epoch+1} | Average Triplet Loss: {avg_loss:.4f} **")
         scheduler.step()
 
-    print("[Main] Evaluating model...")
+    # --- Evaluation ---
+    print("\n[Main] Evaluating final model...")
     evaluate_model(model, test_loader, device=DEVICE)
