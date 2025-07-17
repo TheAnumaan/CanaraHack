@@ -56,24 +56,7 @@ class TCNBlock(nn.Module):
         flattened = conv_out.flatten(start_dim=1)
         return self.project(flattened)
 
-# ModalityEncoder passes the parameters down
-class ModalityEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim, tcn_layers, dropout_rate, sequence_length):
-        super().__init__()
-        self.encoder = TCNBlock(
-            input_dim=input_dim,
-            output_dim=hidden_dim,
-            kernel_size=3,  # Using a fixed kernel size
-            num_layers=tcn_layers, # Using the parameter from Optuna
-            dropout_rate=dropout_rate, # Using the parameter from Optuna
-            sequence_length=sequence_length
-        )
 
-    def forward(self, x):
-        return self.encoder(x)
-
-
-# The main model also accepts the hyperparameters
 class MultimodalEmbeddingModel(nn.Module):
     def __init__(self, sensors, sensor_dims, params):
         super().__init__()
@@ -89,22 +72,26 @@ class MultimodalEmbeddingModel(nn.Module):
             ) for sensor in sensors
         })
 
-        fusion_input_dim = params['hidden_dim'] * len(sensors)
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(params['dropout_rate'])
-        )
+        # Use the new AttentionFusion module
+        self.fusion = AttentionFusion(hidden_dim=params['hidden_dim'])
+
         self.projection = nn.Sequential(
             nn.Linear(128, 128), nn.ReLU(),
             nn.Linear(128, params['proj_dim'])
         )
 
     def forward(self, inputs):
-        embeddings = [self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())]
-        fused = self.fusion(torch.cat(embeddings, dim=1))
+        # The dataloader produces tensors of shape (B, num_modalities, T, D_max)
+        # Create a list of embeddings, one for each modality
+        embeddings = [
+            self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())
+        ]
+        
+        # Pass the list of embeddings to the attention fusion layer
+        fused = self.fusion(embeddings)
+        
         return self.projection(fused)
-    
+
 # Additive Angular Margin Loss (ArcFace)
 class ArcFaceLoss(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50):
@@ -143,51 +130,86 @@ import optuna
 import optuna
 from torch.utils.data import DataLoader
 
-def objective(trial, sensors, sensor_dims, train_dataset, test_dataset):
+from tqdm import tqdm
+
+def objective(trial, sensors, sensor_dims, train_dataset, test_dataset, num_train_users):
     """
-    An Optuna objective function focused on tuning for TripletLoss.
+    An Optuna objective function to find the best hyperparameters.
+    Includes hard negative mining for TripletLoss.
     """
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # 1. Define the search space for hyperparameters
     params = {
         'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True),
-        'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 128]),
+        'hidden_dim': trial.suggest_categorical('hidden_dim', [64, 128]),
         'proj_dim': trial.suggest_categorical('proj_dim', [64, 128]),
         'tcn_layers': trial.suggest_int('tcn_layers', 3, 6),
         'dropout_rate': trial.suggest_float('dropout_rate', 0.2, 0.5),
-        'triplet_margin': trial.suggest_float('triplet_margin', 0.2, 1.0),
-        'sequence_length': 1000, # This is fixed by your dataset
+        'loss_function': trial.suggest_categorical('loss_function', ['TripletLoss', 'ArcFaceLoss']),
+        'sequence_length': 1000
     }
 
-    # 2. Create model and data loaders for this trial
+    # 2. Create model
     model = MultimodalEmbeddingModel(sensors, sensor_dims, params).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'], weight_decay=1e-5)
     
-    # We are only using TripletLoss, so we always use the TripletWrapper
-    loss_fn = nn.TripletMarginLoss(margin=params['triplet_margin'])
-    train_loader = DataLoader(TripletWrapper(train_dataset), batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+    # 3. Select loss function and create the appropriate DataLoader
+    if params['loss_function'] == 'TripletLoss':
+        margin = trial.suggest_float('triplet_margin', 0.2, 1.0)
+        loss_fn = nn.TripletMarginLoss(margin=margin, reduction='mean')
+        # Hard negative mining requires batches with multiple samples from the same class
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+    else: # ArcFaceLoss
+        s = trial.suggest_float('arcface_s', 20.0, 40.0)
+        m = trial.suggest_float('arcface_m', 0.3, 0.7)
+        loss_fn = ArcFaceLoss(in_features=params['proj_dim'], out_features=num_train_users, s=s, m=m).to(DEVICE)
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
 
-    # 3. Run the training loop
-    NUM_TUNING_EPOCHS = 15
+    # 4. Run the training loop
+    NUM_TUNING_EPOCHS = 20 # Increased epochs for better convergence
     for epoch in range(NUM_TUNING_EPOCHS):
         model.train()
-        for anchor, positive, negative in train_loader:
-            anchor, positive, negative = anchor.to(DEVICE), positive.to(DEVICE), negative.to(DEVICE)
-
+        progress_bar = tqdm(train_loader, desc=f"Trial {trial.number} Epoch {epoch+1}/{NUM_TUNING_EPOCHS}", leave=False)
+        for data in progress_bar:
             optimizer.zero_grad()
             
-            anchor_emb = model(anchor)
-            pos_emb = model(positive)
-            neg_emb = model(negative)
+            if params['loss_function'] == 'TripletLoss':
+                inputs, labels = data
+                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                embeddings = model(inputs)
+                
+                # --- Hard Negative Mining Logic ---
+                dist_matrix = torch.cdist(embeddings, embeddings, p=2)
+                is_pos = labels.unsqueeze(1) == labels.unsqueeze(0)
+                is_neg = ~is_pos
+                
+                # For each anchor, find the hardest positive (furthest sample of same class)
+                dist_ap = dist_matrix.clone()
+                dist_ap[~is_pos] = -float('inf')
+                hardest_positive_dist, _ = torch.max(dist_ap, dim=1)
 
-            loss = loss_fn(anchor_emb, pos_emb, neg_emb)
+                # For each anchor, find the hardest negative (closest sample of different class)
+                dist_an = dist_matrix.clone()
+                dist_an[is_pos] = float('inf')
+                hardest_negative_dist, _ = torch.min(dist_an, dim=1)
+                
+                loss = torch.mean(F.relu(hardest_positive_dist - hardest_negative_dist + loss_fn.margin))
+            
+            else: # ArcFaceLoss
+                inputs, labels = data
+                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                embeddings = model(inputs)
+                loss = loss_fn(embeddings, labels)
+
             loss.backward()
             optimizer.step()
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
 
-    # 4. Evaluate the model and return the score to minimize (EER)
+    # 5. Evaluate the model and return the score to minimize (EER)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     auc, eer = evaluate_model(model, test_loader, device=DEVICE, trial=trial)
     
-    # If evaluation failed, eer will be None. Tell Optuna this is a bad trial.
     if eer is None:
         return 1.0  # Return the worst possible EER for a failed trial
 
@@ -197,21 +219,17 @@ def objective(trial, sensors, sensor_dims, train_dataset, test_dataset):
 class ModalityEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim, tcn_layers, dropout_rate, sequence_length):
         super().__init__()
-        # --- DIAGNOSTIC PRINT STATEMENT ---
-        print(f"--- ✅ RUNNING THE NEW MODALITY ENCODER (tcn_layers={tcn_layers}) ---")
-        
         self.encoder = TCNBlock(
             input_dim=input_dim,
             output_dim=hidden_dim,
-            kernel_size=3,
-            num_layers=tcn_layers,
-            dropout_rate=dropout_rate,
+            kernel_size=3,  # Using a fixed kernel size
+            num_layers=tcn_layers, # Using the parameter from Optuna
+            dropout_rate=dropout_rate, # Using the parameter from Optuna
             sequence_length=sequence_length
         )
 
     def forward(self, x):
         return self.encoder(x)
-
 
 class MultimodalFusion(nn.Module):
     def __init__(self, modality_dims, fusion_dim=128):
@@ -251,8 +269,6 @@ class MultimodalEmbeddingModel(nn.Module):
         max_feature_dim = max(sensor_dims.values())
         
         self.encoders = nn.ModuleDict({
-            # --- THIS IS THE FIX ---
-            # The extra 'sensor' argument has been removed from the ModalityEncoder call
             sensor: ModalityEncoder(
                 input_dim=max_feature_dim,
                 hidden_dim=params['hidden_dim'],
@@ -275,7 +291,8 @@ class MultimodalEmbeddingModel(nn.Module):
 
     def forward(self, inputs):
         embeddings = [self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())]
-        fused = self.fusion(torch.cat(embeddings, dim=1))
+        fused_input = torch.cat(embeddings, dim=1) # Corrected fusion input
+        fused = self.fusion(fused_input)
         return self.projection(fused)
 
 
@@ -529,7 +546,53 @@ def split_dataset_by_user(dataset, test_ratio=0.2, min_test_users=2):
 
     return Subset(dataset, train_idx), Subset(dataset, test_idx)
 
+class AttentionFusion(nn.Module):
+    def __init__(self, hidden_dim, attention_dim=128):
+        """
+        Initializes the Attention Fusion mechanism.
+        Args:
+            hidden_dim (int): The feature dimension of each incoming modality embedding.
+            attention_dim (int): The size of the hidden layer in the attention network.
+        """
+        super().__init__()
+        self.attention_net = nn.Sequential(
+            nn.Linear(hidden_dim, attention_dim),
+            nn.Tanh(),
+            nn.Linear(attention_dim, 1)
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim, 128), # Input is the weighted-sum embedding, so its size is hidden_dim
+            nn.ReLU(),
+            nn.Dropout(0.5)
+        )
 
+    def forward(self, embeddings_list):
+        """
+        Processes a list of embeddings from different modalities.
+        Args:
+            embeddings_list (list of Tensors): A list where each element is a tensor
+                                               of shape (batch_size, hidden_dim).
+        Returns:
+            Tensor: A fused embedding of shape (batch_size, 128).
+        """
+        # Stack embeddings to create a (batch_size, num_modalities, hidden_dim) tensor
+        stacked_embeddings = torch.stack(embeddings_list, dim=1)
+        
+        # Compute attention weights for each modality
+        # attn_weights will have shape (batch_size, num_modalities, 1)
+        attn_weights = self.attention_net(stacked_embeddings)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        
+        # Apply attention weights to the embeddings
+        # (B, N, D) * (B, N, 1) -> (B, N, D) where N is num_modalities
+        weighted_embeddings = stacked_embeddings * attn_weights
+        
+        # Sum the weighted embeddings to get a single context vector
+        # Shape: (B, D)
+        context_vector = torch.sum(weighted_embeddings, dim=1)
+        
+        # Pass the final context vector through the fusion layers
+        return self.fusion(context_vector)
 
 
 def balanced_pairs(embeddings, labels, max_pos_pairs=5000, max_neg_pairs=5000):
@@ -744,7 +807,7 @@ if __name__ == "__main__":
     study = optuna.create_study(direction='minimize') # We want to MINIMIZE the EER
 # NEW
     study.optimize(
-        lambda trial: objective(trial, sensor_list, sensor_dims, train_dataset, test_dataset),
+        lambda trial: objective(trial, sensor_list, sensor_dims, train_dataset, test_dataset, num_train_users),
         n_trials=50 
     )
 
