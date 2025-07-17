@@ -20,58 +20,194 @@ print(f"[INFO] Using device: {DEVICE}")
 # Directory path where all user folders (e.g., 000, 001, ...) are located
 DATA_ROOT = "/home/krish/Downloads/HuMI/"
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# TCNBlock now accepts layers and dropout as parameters
+# Correct TCNBlock that requires all parameters
+# Correct TCNBlock that requires all parameters
 class TCNBlock(nn.Module):
-    def __init__(self, input_dim, output_dim, kernel_size=3, num_layers=3, sequence_length=1000):
+    def __init__(self, input_dim, output_dim, kernel_size, num_layers, dropout_rate, sequence_length):
         super().__init__()
-        self.input_dim = input_dim
         layers = []
         for i in range(num_layers):
             in_ch = input_dim if i == 0 else output_dim
             layers.append(nn.Conv1d(
-                in_channels=in_ch,
-                out_channels=output_dim,
-                kernel_size=kernel_size,
-                padding=(kernel_size - 1) * (2 ** i),
-                dilation=2 ** i
+                in_channels=in_ch, out_channels=output_dim, kernel_size=kernel_size,
+                padding=(kernel_size - 1) * (2 ** i), dilation=2 ** i
             ))
             layers.append(nn.ReLU())
             layers.append(nn.BatchNorm1d(output_dim))
-            layers.append(nn.Dropout(0.3))
+            layers.append(nn.Dropout(dropout_rate))
 
         self.network = nn.Sequential(*layers)
         
-        # --- THIS IS THE FIX ---
-        # Dynamically determine the flattened size by doing a dummy forward pass.
-        # This is robust to changes in padding, kernel size, etc.
         with torch.no_grad():
-            # Create a dummy tensor with the expected input shape: (Batch, Channels, Length)
             dummy_input = torch.zeros(1, input_dim, sequence_length)
-            # Pass it through the convolutional network
             dummy_output = self.network(dummy_input)
-            # Get the size of the flattened output
             flattened_size = dummy_output.flatten(1).shape[1]
             
-        # Create the projection layer with the correctly calculated input size
         self.project = nn.Linear(flattened_size, output_dim)
 
     def forward(self, x):
-        # x is (B, T, D)
-        x = x.permute(0, 2, 1)  # Permute to (B, D, T) for Conv1d
-
-        conv_out = self.network(x) # Output shape: (B, output_dim, T_new)
-        
-        # Flatten channels and time, then project to the final embedding size
+        x = x.permute(0, 2, 1)
+        conv_out = self.network(x)
         flattened = conv_out.flatten(start_dim=1)
-        out = self.project(flattened)
+        return self.project(flattened)
+
+# ModalityEncoder passes the parameters down
+class ModalityEncoder(nn.Module):
+    def __init__(self, input_dim, hidden_dim, tcn_layers, dropout_rate, sequence_length):
+        super().__init__()
+        self.encoder = TCNBlock(
+            input_dim=input_dim,
+            output_dim=hidden_dim,
+            kernel_size=3,  # Using a fixed kernel size
+            num_layers=tcn_layers, # Using the parameter from Optuna
+            dropout_rate=dropout_rate, # Using the parameter from Optuna
+            sequence_length=sequence_length
+        )
+
+    def forward(self, x):
+        return self.encoder(x)
+
+
+# The main model also accepts the hyperparameters
+class MultimodalEmbeddingModel(nn.Module):
+    def __init__(self, sensors, sensor_dims, params):
+        super().__init__()
+        max_feature_dim = max(sensor_dims.values())
         
-        return out
+        self.encoders = nn.ModuleDict({
+            sensor: ModalityEncoder(
+                input_dim=max_feature_dim,
+                hidden_dim=params['hidden_dim'],
+                tcn_layers=params['tcn_layers'],
+                dropout_rate=params['dropout_rate'],
+                sequence_length=params['sequence_length']
+            ) for sensor in sensors
+        })
+
+        fusion_input_dim = params['hidden_dim'] * len(sensors)
+        self.fusion = nn.Sequential(
+            nn.Linear(fusion_input_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(params['dropout_rate'])
+        )
+        self.projection = nn.Sequential(
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, params['proj_dim'])
+        )
+
+    def forward(self, inputs):
+        embeddings = [self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())]
+        fused = self.fusion(torch.cat(embeddings, dim=1))
+        return self.projection(fused)
+    
+# Additive Angular Margin Loss (ArcFace)
+class ArcFaceLoss(nn.Module):
+    def __init__(self, in_features, out_features, s=30.0, m=0.50):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.s = s
+        self.m = m
+        self.weight = nn.Parameter(torch.FloatTensor(out_features, in_features))
+        nn.init.xavier_uniform_(self.weight)
+
+        self.cos_m = torch.cos(torch.tensor(m))
+        self.sin_m = torch.sin(torch.tensor(m))
+        self.th = torch.cos(torch.tensor(torch.pi) - m)
+        self.mm = torch.sin(torch.tensor(torch.pi) - m) * m
+
+    def forward(self, embeddings, labels):
+        # embeddings are (B, D), labels are (B)
+        cosine = F.linear(F.normalize(embeddings), F.normalize(self.weight))
+        sine = torch.sqrt(1.0 - torch.pow(cosine, 2).clamp(0, 1))
+        phi = cosine * self.cos_m - sine * self.sin_m
+        phi = torch.where(cosine > self.th, phi, cosine - self.mm)
+
+        one_hot = torch.zeros(cosine.size(), device=embeddings.device)
+        one_hot.scatter_(1, labels.view(-1, 1).long(), 1)
+        
+        output = (one_hot * phi) + ((1.0 - one_hot) * cosine)
+        output *= self.s
+        
+        return F.cross_entropy(output, labels)
+    
+import optuna
+
+# Keep your Dataset, TripletWrapper, and evaluate_model functions as they are.
+
+import optuna
+from torch.utils.data import DataLoader
+
+def objective(trial, sensors, sensor_dims, train_dataset, test_dataset):
+    """
+    An Optuna objective function focused on tuning for TripletLoss.
+    """
+    # 1. Define the search space for hyperparameters
+    params = {
+        'learning_rate': trial.suggest_float('learning_rate', 1e-5, 1e-3, log=True),
+        'hidden_dim': trial.suggest_categorical('hidden_dim', [32, 64, 128]),
+        'proj_dim': trial.suggest_categorical('proj_dim', [64, 128]),
+        'tcn_layers': trial.suggest_int('tcn_layers', 3, 6),
+        'dropout_rate': trial.suggest_float('dropout_rate', 0.2, 0.5),
+        'triplet_margin': trial.suggest_float('triplet_margin', 0.2, 1.0),
+        'sequence_length': 1000, # This is fixed by your dataset
+    }
+
+    # 2. Create model and data loaders for this trial
+    model = MultimodalEmbeddingModel(sensors, sensor_dims, params).to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=params['learning_rate'])
+    
+    # We are only using TripletLoss, so we always use the TripletWrapper
+    loss_fn = nn.TripletMarginLoss(margin=params['triplet_margin'])
+    train_loader = DataLoader(TripletWrapper(train_dataset), batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+
+    # 3. Run the training loop
+    NUM_TUNING_EPOCHS = 15
+    for epoch in range(NUM_TUNING_EPOCHS):
+        model.train()
+        for anchor, positive, negative in train_loader:
+            anchor, positive, negative = anchor.to(DEVICE), positive.to(DEVICE), negative.to(DEVICE)
+
+            optimizer.zero_grad()
+            
+            anchor_emb = model(anchor)
+            pos_emb = model(positive)
+            neg_emb = model(negative)
+
+            loss = loss_fn(anchor_emb, pos_emb, neg_emb)
+            loss.backward()
+            optimizer.step()
+
+    # 4. Evaluate the model and return the score to minimize (EER)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    auc, eer = evaluate_model(model, test_loader, device=DEVICE, trial=trial)
+    
+    # If evaluation failed, eer will be None. Tell Optuna this is a bad trial.
+    if eer is None:
+        return 1.0  # Return the worst possible EER for a failed trial
+
+    return eer
 
 
 class ModalityEncoder(nn.Module):
-    def __init__(self, sensor_type, input_dim, hidden_dim=64, sequence_length=1000):
+    def __init__(self, input_dim, hidden_dim, tcn_layers, dropout_rate, sequence_length):
         super().__init__()
-        self.sensor_type = sensor_type
-        self.encoder = TCNBlock(input_dim, output_dim=hidden_dim, num_layers=4, sequence_length=sequence_length)
+        # --- DIAGNOSTIC PRINT STATEMENT ---
+        print(f"--- ✅ RUNNING THE NEW MODALITY ENCODER (tcn_layers={tcn_layers}) ---")
+        
+        self.encoder = TCNBlock(
+            input_dim=input_dim,
+            output_dim=hidden_dim,
+            kernel_size=3,
+            num_layers=tcn_layers,
+            dropout_rate=dropout_rate,
+            sequence_length=sequence_length
+        )
 
     def forward(self, x):
         return self.encoder(x)
@@ -108,46 +244,38 @@ class SigLipLoss(nn.Module):
         sim_scores = torch.sigmoid(sim_matrix)
         loss = F.binary_cross_entropy(sim_scores, label_matrix)
         return loss
+# Correct main model that initializes the other two correctly
 class MultimodalEmbeddingModel(nn.Module):
-    def __init__(self, sensors, sensor_dims, hidden_dim=64, proj_dim=64, sequence_length=1000):
+    def __init__(self, sensors, sensor_dims, params):
         super().__init__()
-        # Calculate the true input dimension for each TCN based on the dataset's max feature padding
-        # This makes the model more robust if the sensor list changes.
         max_feature_dim = max(sensor_dims.values())
         
         self.encoders = nn.ModuleDict({
-            sensor: ModalityEncoder(sensor,
-                                   input_dim=max_feature_dim, # All encoders receive the same padded dimension
-                                   hidden_dim=hidden_dim,
-                                   sequence_length=sequence_length)
-            for sensor in sensors
+            # --- THIS IS THE FIX ---
+            # The extra 'sensor' argument has been removed from the ModalityEncoder call
+            sensor: ModalityEncoder(
+                input_dim=max_feature_dim,
+                hidden_dim=params['hidden_dim'],
+                tcn_layers=params['tcn_layers'],
+                dropout_rate=params['dropout_rate'],
+                sequence_length=params['sequence_length']
+            ) for sensor in sensors
         })
 
-        # The fusion layer input is the sum of all encoder outputs
-        fusion_input_dim = hidden_dim * len(sensors)
+        fusion_input_dim = params['hidden_dim'] * len(sensors)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
-            nn.Dropout(0.5)
+            nn.Dropout(params['dropout_rate'])
         )
-
-        # Projection Head for contrastive loss
         self.projection = nn.Sequential(
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, proj_dim)
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, params['proj_dim'])
         )
 
     def forward(self, inputs):
-        # The dataloader now produces tensors of shape (B, num_modalities, T, D_max)
-        embeddings = []
-        for i, sensor in enumerate(self.encoders.keys()):
-            # Pass the corresponding modality slice to its encoder
-            x = inputs[:, i, :, :]  # (B, T, D_max)
-            embeddings.append(self.encoders[sensor](x))
-        
-        fused_input = torch.cat(embeddings, dim=1)
-        fused = self.fusion(fused_input)
+        embeddings = [self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())]
+        fused = self.fusion(torch.cat(embeddings, dim=1))
         return self.projection(fused)
 
 
@@ -431,17 +559,23 @@ def balanced_pairs(embeddings, labels, max_pos_pairs=5000, max_neg_pairs=5000):
 
     return pos_pairs, neg_pairs
 
-def evaluate_model(model, dataloader, device):
+from sklearn.metrics import roc_curve, roc_auc_score
+import matplotlib.pyplot as plt
+import numpy as np
+import random
+import torch.nn.functional as F
+
+def evaluate_model(model, dataloader, device, trial=None):
     """
     Evaluates the model by calculating genuine and impostor scores.
+    Saves plots to a file and handles evaluation failures gracefully.
     """
     model.eval()
     all_embeddings = []
     all_labels = []
 
-    print("\n[Eval] Generating embeddings for the test set...")
     with torch.no_grad():
-        for x, y in tqdm(dataloader, desc="Evaluating"):
+        for x, y in dataloader:
             x = x.to(device)
             emb = model(x)
             all_embeddings.append(emb.cpu())
@@ -450,44 +584,39 @@ def evaluate_model(model, dataloader, device):
     embeddings = F.normalize(torch.cat(all_embeddings), dim=1)
     labels = torch.cat(all_labels)
 
-    # Group embeddings by user ID
+    # Group embeddings by user ID, only including users with multiple sessions
     user_to_embeddings = {}
     for user_id in torch.unique(labels):
         indices = (labels == user_id).nonzero(as_tuple=True)[0]
-        user_to_embeddings[user_id.item()] = embeddings[indices]
+        if len(indices) > 1:
+            user_to_embeddings[user_id.item()] = embeddings[indices]
 
-    print(f"[Eval] Found {len(user_to_embeddings)} unique users in the test set.")
-    
+    # Check if evaluation is possible
+    if len(user_to_embeddings) < 2:
+        print("[Error] Evaluation failed. Need at least 2 users with multiple sessions.")
+        return None, None
+
+    # Calculate genuine scores
     genuine_scores = []
-    impostor_scores = []
-
-    # --- Calculate Genuine Scores (Same User, Different Sessions) ---
-    print("[Eval] Calculating genuine scores...")
     for user_id, embs in user_to_embeddings.items():
-        if len(embs) > 1:
-            for i in range(len(embs)):
-                for j in range(i + 1, len(embs)):
-                    sim = F.cosine_similarity(embs[i].unsqueeze(0), embs[j].unsqueeze(0)).item()
-                    genuine_scores.append(sim)
+        for i in range(len(embs)):
+            for j in range(i + 1, len(embs)):
+                sim = F.cosine_similarity(embs[i].unsqueeze(0), embs[j].unsqueeze(0)).item()
+                genuine_scores.append(sim)
 
-    # --- Calculate Impostor Scores (Different Users) ---
-    print("[Eval] Calculating impostor scores...")
+    if not genuine_scores:
+        print("[Error] No genuine pairs could be formed.")
+        return None, None
+
+    # Calculate impostor scores
+    impostor_scores = []
     user_ids = list(user_to_embeddings.keys())
-    # To keep computation manageable, we sample a number of impostor pairs
-    num_impostor_pairs = len(genuine_scores) * 2 # Aim for a 2:1 ratio of impostors to genuines
-    
-    for _ in range(num_impostor_pairs):
+    for _ in range(len(genuine_scores) * 2): # Sample a reasonable number of impostor pairs
         u1_id, u2_id = random.sample(user_ids, 2)
         emb1 = random.choice(user_to_embeddings[u1_id])
         emb2 = random.choice(user_to_embeddings[u2_id])
-        sim = F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item()
-        impostor_scores.append(sim)
+        impostor_scores.append(F.cosine_similarity(emb1.unsqueeze(0), emb2.unsqueeze(0)).item())
 
-    if not genuine_scores or not impostor_scores:
-        print("[Error] Could not form both genuine and impostor pairs. Cannot evaluate.")
-        return
-
-    # --- Calculate Metrics ---
     scores = np.array(genuine_scores + impostor_scores)
     y_true = np.array([1] * len(genuine_scores) + [0] * len(impostor_scores))
 
@@ -495,22 +624,21 @@ def evaluate_model(model, dataloader, device):
     eer = fpr[np.nanargmin(np.abs(fpr - (1 - tpr)))]
     auc = roc_auc_score(y_true, scores)
 
-    print("\n--- Evaluation Results ---")
-    print(f"Genuine Pairs Found: {len(genuine_scores)}")
-    print(f"Impostor Pairs Sampled: {len(impostor_scores)}")
-    print(f"AUC: {auc:.4f}")
-    print(f"EER (Equal Error Rate): {eer:.4f}")
-
-    # Plotting
+    # Save plot to file instead of showing it
     plt.figure(figsize=(10, 6))
-    plt.hist(genuine_scores, bins=50, alpha=0.7, density=True, label='Genuine Scores (Same User)')
-    plt.hist(impostor_scores, bins=50, alpha=0.7, density=True, label='Impostor Scores (Different User)')
-    plt.title('Similarity Score Distribution on Test Set')
+    plt.hist(genuine_scores, bins=50, alpha=0.7, density=True, label=f'Genuine (Same User)')
+    plt.hist(impostor_scores, bins=50, alpha=0.7, density=True, label=f'Impostor (Different User)')
+    plt.title(f"Trial {trial.number if trial else 'N/A'} - Scores (EER: {eer:.4f})")
     plt.xlabel('Cosine Similarity')
     plt.ylabel('Density')
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.show()
+    
+    filename = f"trial_{trial.number}_scores.png" if trial else "final_evaluation_scores.png"
+    plt.savefig(filename)
+    plt.close() # Close the plot to free up memory
+
+    return auc, eer
 
 def split_dataset_by_user(dataset, test_ratio=0.2, min_sessions_for_test=2, random_state=42):
     """
@@ -588,77 +716,41 @@ class TripletWrapper(Dataset):
         return anchor_data, pos_data, neg_data
 
 if __name__ == "__main__":
-    # --- Configuration ---
-    MAX_LEN = 1000
-    NUM_EPOCHS = 30 # Increased epochs
-    BATCH_SIZE = 16
-    LEARNING_RATE = 1e-4
-
+    # --- Basic Config ---
+    DATA_ROOT = "/home/krish/Downloads/HuMI/"
     sensor_list = [
-        'key_data', 'swipe', 'touch_touch', 'sensor_grav', 'sensor_gyro', 
-        'sensor_lacc', 'sensor_magn', 'sensor_nacc' # A smaller, more focused list can help
+        'key_data', 'swipe', 'touch_touch', 'sensor_grav', 'sensor_gyro',
+        'sensor_lacc', 'sensor_magn', 'sensor_nacc'
     ]
-    
-    # These dims are for reference; the model now uses the max dim automatically
     sensor_dims = {
-        'key_data': 1, 'swipe': 6, 'touch_touch': 6, # Corrected to 6
-        'sensor_grav': 3, 'sensor_gyro': 3, 'sensor_lacc': 3,
-        'sensor_magn': 3, 'sensor_nacc': 3
+        'key_data': 1, 'swipe': 6, 'touch_touch': 6, 'sensor_grav': 3,
+        'sensor_gyro': 3, 'sensor_lacc': 3, 'sensor_magn': 3, 'sensor_nacc': 3
     }
 
-    # --- Data Loading ---
-    print("[Main] Creating dataset...")
-    dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list, max_len=MAX_LEN)
-    
-    print("[Main] Splitting train/test users...")
+    # --- Load and Split Data ONCE ---
+    print("[Main] Loading and splitting data...")
+    dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list, max_len=1000)
     train_dataset, test_dataset = split_dataset_by_user(dataset)
-
-    triplet_train_dataset = TripletWrapper(train_dataset)
-    triplet_loader = DataLoader(triplet_train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-
-    # --- Model Initialization ---
-    print("[Main] Building model...")
-    model = MultimodalEmbeddingModel(
-        sensors=sensor_list,
-        sensor_dims=sensor_dims,
-        hidden_dim=64,
-        proj_dim=64,
-        sequence_length=MAX_LEN
-    ).to(DEVICE)
     
-    loss_fn = nn.TripletMarginLoss(margin=0.5)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
+    # We need the number of unique users for the ArcFace loss function's output layer
+    train_user_ids = {s['user_id'] for i, s in enumerate(dataset.samples) if i in train_dataset.indices}
+    num_train_users = len(train_user_ids)
+    print(f"[Main] Found {num_train_users} unique users in the training set.")
 
-    # --- Training Loop ---
-    print(f"[Main] Training for {NUM_EPOCHS} epochs...")
-    for epoch in range(NUM_EPOCHS):
-        model.train()
-        total_loss = 0
-        
-        # Use tqdm for progress bar
-        progress_bar = tqdm(triplet_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}")
-        for anchor, positive, negative in progress_bar:
-            anchor, positive, negative = anchor.to(DEVICE), positive.to(DEVICE), negative.to(DEVICE)
 
-            optimizer.zero_grad()
-            
-            anchor_emb = F.normalize(model(anchor))
-            pos_emb = F.normalize(model(positive))
-            neg_emb = F.normalize(model(negative))
+    # --- Optuna Study ---
+    print("[Main] Starting hyperparameter search with Optuna...")
+    # We pass the datasets as extra arguments to the objective function using a lambda
+    study = optuna.create_study(direction='minimize') # We want to MINIMIZE the EER
+# NEW
+    study.optimize(
+        lambda trial: objective(trial, sensor_list, sensor_dims, train_dataset, test_dataset),
+        n_trials=50 
+    )
 
-            loss = loss_fn(anchor_emb, pos_emb, neg_emb)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}")
-
-        avg_loss = total_loss / len(triplet_loader)
-        print(f"** End of Epoch {epoch+1} | Average Triplet Loss: {avg_loss:.4f} **")
-        scheduler.step()
-
-    # --- Evaluation ---
-    print("\n[Main] Evaluating final model...")
-    evaluate_model(model, test_loader, device=DEVICE)
+    # --- Print Best Results ---
+    print("\n\n--- Optuna Search Complete ---")
+    print(f"Best trial EER: {study.best_value:.4f}")
+    print("Best hyperparameters:")
+    for key, value in study.best_params.items():
+        print(f"  {key}: {value}")
