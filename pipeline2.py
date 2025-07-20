@@ -83,7 +83,6 @@ class AttentionFusion(nn.Module):
         context_vector = torch.sum(weighted_embeddings, dim=1) # (B, D)
         return self.fusion_layer(context_vector)
 
-# Use this simpler model for now
 class MultimodalEmbeddingModel(nn.Module):
     def __init__(self, sensors, sensor_dims, params):
         super().__init__()
@@ -99,15 +98,12 @@ class MultimodalEmbeddingModel(nn.Module):
             ) for sensor in sensors
         })
 
-        # --- REVERTED TO SIMPLER FUSION ---
-        # We are back to simple concatenation and a linear layer.
         fusion_input_dim = params['hidden_dim'] * len(sensors)
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, 128),
             nn.ReLU(),
             nn.Dropout(params['dropout_rate'])
         )
-        # --- END REVERT ---
 
         self.projection = nn.Sequential(
             nn.Linear(128, 128), nn.ReLU(),
@@ -115,59 +111,10 @@ class MultimodalEmbeddingModel(nn.Module):
         )
 
     def forward(self, inputs):
-        # This forward pass uses simple concatenation
         embeddings = [self.encoders[sensor](inputs[:, i, :, :]) for i, sensor in enumerate(self.encoders.keys())]
         fused_input = torch.cat(embeddings, dim=1)
         fused = self.fusion(fused_input)
         return self.projection(fused)
-    
-class ContrastiveDataWrapper(Dataset):
-    def __init__(self, dataset):
-        self.dataset = dataset
-        self.labels = [self.dataset[i][1] for i in range(len(self.dataset))]
-        
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        # Get the first sample
-        img1, label1 = self.dataset[idx]
-        
-        # Decide whether to get a positive (1) or negative (0) pair
-        should_get_positive = random.randint(0, 1)
-        
-        if should_get_positive:
-            # Find all indices with the same label, excluding the current one
-            same_class_indices = [i for i, label in enumerate(self.labels) if label == label1 and i != idx]
-            # If no other sample from the same class exists, just duplicate the anchor
-            if not same_class_indices:
-                img2, _ = self.dataset[idx]
-            else:
-                img2, _ = self.dataset[random.choice(same_class_indices)]
-            return img1, img2, torch.tensor(1, dtype=torch.float)
-        else:
-            # Find all indices with a different label
-            diff_class_indices = [i for i, label in enumerate(self.labels) if label != label1]
-            img2, _ = self.dataset[random.choice(diff_class_indices)]
-            return img1, img2, torch.tensor(0, dtype=torch.float)
-
-class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=1.0):
-        super().__init__()
-        self.margin = margin
-
-    def forward(self, embedding1, embedding2, label):
-        # label=1 for positive pair, 0 for negative pair
-        euclidean_distance = F.pairwise_distance(embedding1, embedding2, keepdim=True)
-        
-        # Loss for positive pairs: push them closer (distance should be small)
-        loss_positive = (label) * torch.pow(euclidean_distance, 2)
-        
-        # Loss for negative pairs: push them apart (distance should be > margin)
-        loss_negative = (1 - label) * torch.pow(torch.clamp(self.margin - euclidean_distance, min=0.0), 2)
-        
-        loss_contrastive = torch.mean(loss_positive + loss_negative)
-        return loss_contrastive
 
 # =================================================================================================
 # --- 3. Data Handling ---
@@ -216,7 +163,7 @@ class MultimodalSessionDataset(Dataset):
         for sensor in self.sensor_list:
             path = sample['paths'].get(sensor)
             data_loaded = False
-            if path and os.path.exists(path) and os.path.getsize(path) > 5: # Check for non-empty file
+            if path and os.path.exists(path) and os.path.getsize(path) > 5:
                 try:
                     with open(path, 'r', errors='ignore') as f: first_line = f.readline()
                     separator = ';' if ';' in first_line else ','
@@ -226,7 +173,7 @@ class MultimodalSessionDataset(Dataset):
                         numeric_df = df.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all')
                         if not numeric_df.empty:
                             numeric_df.fillna(0, inplace=True)
-                            if numeric_df.std().sum() > 0: # Avoid division by zero for constant columns
+                            if numeric_df.std().sum() > 0:
                                 numeric_df = (numeric_df - numeric_df.mean()) / (numeric_df.std().replace(0, 1))
                             data = torch.tensor(numeric_df.values, dtype=torch.float)
                             data_loaded = True
@@ -266,15 +213,21 @@ def split_dataset_by_user(dataset, test_ratio=0.2, min_sessions_for_test=2, rand
 # --- 4. Training and Evaluation Functions ---
 # =================================================================================================
 
-from tqdm import tqdm
+class DataAugmentation:
+    def __init__(self, sigma=0.02, shift_fraction=0.05):
+        self.sigma = sigma
+        self.shift_fraction = shift_fraction
 
-from tqdm import tqdm
+    def __call__(self, sample_batch):
+        noise = torch.randn_like(sample_batch) * self.sigma
+        augmented_batch = sample_batch + noise
+        max_shift = int(sample_batch.shape[2] * self.shift_fraction)
+        shifts = torch.randint(-max_shift, max_shift, (sample_batch.shape[0],))
+        for i in range(sample_batch.shape[0]):
+            augmented_batch[i] = torch.roll(augmented_batch[i], shifts=shifts[i].item(), dims=1)
+        return augmented_batch
 
 def train_model(model, dataloader, loss_fn, optimizer, scheduler, num_epochs, device):
-    """
-    Trains the model using batch-hard triplet mining and data augmentation.
-    """
-    # Create an instance of the augmentation transform
     augment = DataAugmentation(sigma=0.01, shift_fraction=0.1)
 
     for epoch in range(num_epochs):
@@ -283,27 +236,12 @@ def train_model(model, dataloader, loss_fn, optimizer, scheduler, num_epochs, de
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
 
         for i, (inputs, labels) in enumerate(progress_bar):
-            
-            # --- DIAGNOSTIC PRINT STATEMENT ---
-            # This will only run for the very first batch of the very first epoch
-            if epoch == 0 and i == 0:
-                print("\n--- ✅ Data Augmentation is ACTIVE ---")
-                print(f"Original data mean: {inputs.mean():.4f}, std: {inputs.std():.4f}")
-                
-            # Apply augmentation to the input batch
             inputs = augment(inputs)
-
-            if epoch == 0 and i == 0:
-                print(f"Augmented data mean: {inputs.mean():.4f}, std: {inputs.std():.4f}\n")
-            # --- END DIAGNOSTIC ---
-
-            
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             
             embeddings = model(inputs)
             
-            # Batch-Hard Triplet Mining
             dist_matrix = torch.cdist(embeddings, embeddings, p=2)
             is_pos = labels.unsqueeze(1) == labels.unsqueeze(0)
             is_neg = ~is_pos
@@ -326,57 +264,6 @@ def train_model(model, dataloader, loss_fn, optimizer, scheduler, num_epochs, de
         avg_loss = total_loss / len(dataloader)
         print(f"** End of Epoch {epoch+1} | Average Triplet Loss: {avg_loss:.4f} **")
         scheduler.step()
-
-class DataAugmentation:
-    """
-    Applies simple augmentations to sensor data tensors.
-    """
-    def __init__(self, sigma=0.02, shift_fraction=0.05):
-        self.sigma = sigma
-        self.shift_fraction = shift_fraction
-
-    def __call__(self, sample_batch):
-        # sample_batch shape: (Batch, Modalities, Time, Features)
-        
-        # Add Jitter (Noise)
-        noise = torch.randn_like(sample_batch) * self.sigma
-        augmented_batch = sample_batch + noise
-        
-        # Time Shifting (apply the same shift to all modalities for a given sample)
-        max_shift = int(sample_batch.shape[2] * self.shift_fraction)
-        shifts = torch.randint(-max_shift, max_shift, (sample_batch.shape[0],))
-        
-        for i in range(sample_batch.shape[0]):
-            augmented_batch[i] = torch.roll(augmented_batch[i], shifts=shifts[i].item(), dims=1)
-            
-        return augmented_batch
-
-class TransformerFusion(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_layers, dropout):
-        super().__init__()
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads, 
-            dim_feedforward=embed_dim * 4,
-            dropout=dropout,
-            activation='relu',
-            batch_first=True  # Important: expects (Batch, Seq, Features)
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.final_projection = nn.Linear(embed_dim, 128) # Project to final fusion size
-
-    def forward(self, embeddings_list):
-        # embeddings_list is a list of tensors from each encoder
-        # Stack embeddings: (Batch, Num_Modalities, Embedding_Dim)
-        stacked_embeddings = torch.stack(embeddings_list, dim=1)
-        
-        # Pass through the transformer encoder
-        fused_output = self.transformer_encoder(stacked_embeddings)
-        
-        # Average the output across the modalities
-        fused_output = fused_output.mean(dim=1)
-        
-        return self.final_projection(fused_output)
 
 def evaluate_model(model, dataloader, device):
     model.eval()
@@ -433,19 +320,18 @@ if __name__ == "__main__":
     print(f"[INFO] Using device: {DEVICE}")
 
     # --- Configuration ---
-    # These are strong baseline parameters you can tune manually
     model_params = {
-        'hidden_dim': 128,         # Dimension of each sensor's embedding
-        'proj_dim': 128,           # Final output embedding dimension
-        'tcn_layers': 5,           # Number of layers in each TCN encoder
-        'dropout_rate': 0.4,       # Dropout rate used throughout the model
+        'hidden_dim': 128,
+        'proj_dim': 128,
+        'tcn_layers': 5,
+        'dropout_rate': 0.4,
         'sequence_length': MAX_LEN
     }
     training_params = {
-        'num_epochs': 40,          # Increase for better performance
-        'batch_size': 32,          # Batch size for training
-        'learning_rate': 0.0002,   # A good starting learning rate
-        'triplet_margin': 0.5      # Margin for the triplet loss
+        'num_epochs': 40,
+        'batch_size': 32,
+        'learning_rate': 0.0002,
+        'triplet_margin': 0.5
     }
 
     sensor_list = [
@@ -462,7 +348,6 @@ if __name__ == "__main__":
     full_dataset = MultimodalSessionDataset(DATA_ROOT, sensor_list, max_len=MAX_LEN)
     train_subset, test_subset = split_dataset_by_user(full_dataset)
     
-    # Use standard DataLoader for both training (with hard mining) and testing
     train_loader = DataLoader(train_subset, batch_size=training_params['batch_size'], shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_subset, batch_size=training_params['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
@@ -476,6 +361,15 @@ if __name__ == "__main__":
     # --- Start Training ---
     print(f"[Main] Starting training for {training_params['num_epochs']} epochs...")
     train_model(model, train_loader, loss_fn, optimizer, scheduler, training_params['num_epochs'], DEVICE)
+
+    # =========================================================================
+    # --- ✅ SAVE THE MODEL STATE DICTIONARY ---
+    # =========================================================================
+    MODEL_SAVE_PATH = "multimodal_authentication_model.pkl"
+    print(f"\n[Main] Saving model state dictionary to {MODEL_SAVE_PATH}...")
+    torch.save(model.state_dict(), MODEL_SAVE_PATH)
+    print("[Main] Model saved successfully.")
+    # =========================================================================
 
     # --- Final Evaluation ---
     print("\n[Main] Evaluating final model on the test set...")
